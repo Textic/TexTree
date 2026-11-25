@@ -1,8 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use futures_channel::mpsc::unbounded;
 use futures_util::StreamExt as _;
@@ -24,10 +26,10 @@ use gpui_kit::{
 };
 
 use crate::models::{
-    AccentPreset, AppSettings, DiskTree, ExtensionStat, NodeId, SizeUnit, SortColumn, SortSpec,
-    VisibleRow, VolumeInfo,
+    AccentPreset, AppSettings, DiskTree, ExtensionStat, NodeId, ScanMode, SizeUnit, SortColumn,
+    SortSpec, VisibleRow, VolumeInfo,
 };
-use crate::platform::{self, FileLockStatus};
+use crate::platform::{self, FileLockStatus, ServiceStatus};
 use crate::scanner::{self, ScanEvent, ScanProgress, ScanTarget};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
@@ -78,15 +80,48 @@ pub enum ScanState {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScanCacheKey {
+    AllFixedDrives,
+    Volume(String),
+    Folder(PathBuf),
+}
+
+impl ScanCacheKey {
+    pub fn from_target(target: &ScanTarget) -> Self {
+        match target {
+            ScanTarget::AllFixedDrives => Self::AllFixedDrives,
+            ScanTarget::Volume(v) => Self::Volume(
+                v.root_path
+                    .to_string_lossy()
+                    .replace('/', "\\")
+                    .to_ascii_uppercase(),
+            ),
+            ScanTarget::Folder(p) => Self::Folder(p.clone()),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CachedScan {
+    pub tree: Arc<DiskTree>,
+    pub scanned_at: Instant,
+    pub from_all_drives: bool,
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     pub settings: AppSettings,
     pub is_elevated: bool,
+    pub service_status: ServiceStatus,
+    pub service_busy: bool,
     pub volumes: Vec<VolumeInfo>,
     pub selected_target: ScanTarget,
     pub scan_state: ScanState,
     cancel_token: Option<Arc<AtomicBool>>,
     scan_seq: u64,
+    pub scan_cache: HashMap<ScanCacheKey, CachedScan>,
+    pub current_scan_from_cache: bool,
     pub tree: Option<Arc<DiskTree>>,
     pub tree_version: u64,
     pub active_tab: MainTab,
@@ -98,6 +133,7 @@ pub struct Workspace {
     pub selected_has_fs_path: bool,
     pub treemap_root: Option<NodeId>,
     pub treemap_hovered: Option<NodeId>,
+    pub list_hovered: Option<NodeId>,
     pub treemap_cache: Rc<RefCell<TreemapCanvasCache>>,
     pub visible_rows: Vec<VisibleRow>,
     pub top_file_rows: Vec<NodeId>,
@@ -146,11 +182,15 @@ impl Workspace {
             focus_handle,
             settings,
             is_elevated: platform::is_elevated(),
+            service_status: platform::query_service_status(),
+            service_busy: false,
             volumes,
             selected_target,
             scan_state: ScanState::Idle,
             cancel_token: None,
             scan_seq: 0,
+            scan_cache: HashMap::new(),
+            current_scan_from_cache: false,
             tree: None,
             tree_version: 0,
             active_tab: MainTab::Tree,
@@ -162,6 +202,7 @@ impl Workspace {
             selected_has_fs_path: false,
             treemap_root: None,
             treemap_hovered: None,
+            list_hovered: None,
             treemap_cache: Rc::new(RefCell::new(TreemapCanvasCache::default())),
             visible_rows: Vec::new(),
             top_file_rows: Vec::new(),
@@ -201,6 +242,99 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn has_mft_privileges(&self) -> bool {
+        self.is_elevated
+            || (self.settings.scan_mode == ScanMode::Service
+                && self.service_status == ServiceStatus::Running)
+    }
+
+    pub fn has_cached_target(&self, target: &ScanTarget) -> bool {
+        let key = ScanCacheKey::from_target(target);
+        if self.scan_cache.contains_key(&key) {
+            return true;
+        }
+        if let ScanTarget::Volume(vol) = target
+            && let Some(all) = self.scan_cache.get(&ScanCacheKey::AllFixedDrives)
+        {
+            return all.tree.find_volume_child(&vol.root_path).is_some();
+        }
+        false
+    }
+
+    /// Switches immediately to a cached session scan if available (including extracting a single
+    /// drive subtree instantaneously from a cached `Entire PC` scan); otherwise starts a fresh scan.
+    pub fn select_or_scan_target(&mut self, target: ScanTarget, cx: &mut Context<Self>) {
+        let is_scanning = matches!(self.scan_state, ScanState::Scanning(_));
+        if !is_scanning && self.tree.is_some() && self.selected_target == target {
+            return;
+        }
+
+        let key = ScanCacheKey::from_target(&target);
+        if let Some(cached) = self.scan_cache.get(&key).cloned() {
+            if let Some(prev) = self.cancel_token.take() {
+                prev.store(true, Ordering::Relaxed);
+            }
+            self.scan_seq = self.scan_seq.wrapping_add(1);
+            self.selected_target = target;
+            self.scan_state = ScanState::Ready;
+            self.toast_message = None;
+            self.apply_loaded_tree(cached.tree, true);
+            cx.notify();
+            return;
+        }
+
+        if let ScanTarget::Volume(vol) = &target
+            && let Some(all_cached) = self.scan_cache.get(&ScanCacheKey::AllFixedDrives).cloned()
+            && let Some(vol_node_id) = all_cached.tree.find_volume_child(&vol.root_path)
+            && let Some(sub_tree) = all_cached.tree.extract_subtree(
+                vol_node_id,
+                target.display_label(),
+                Some(vol.root_path.clone()),
+            )
+        {
+            if let Some(prev) = self.cancel_token.take() {
+                prev.store(true, Ordering::Relaxed);
+            }
+            self.scan_seq = self.scan_seq.wrapping_add(1);
+            let arc_sub = Arc::new(sub_tree);
+            self.scan_cache.insert(
+                key,
+                CachedScan {
+                    tree: arc_sub.clone(),
+                    scanned_at: all_cached.scanned_at,
+                    from_all_drives: true,
+                },
+            );
+            self.selected_target = target;
+            self.scan_state = ScanState::Ready;
+            self.toast_message = None;
+            self.apply_loaded_tree(arc_sub, true);
+            cx.notify();
+            return;
+        }
+
+        self.start_scan(target, cx);
+    }
+
+    fn apply_loaded_tree(&mut self, tree: Arc<DiskTree>, from_cache: bool) {
+        let root_id = tree.root;
+        let mut expanded = HashSet::new();
+        expanded.insert(root_id);
+        self.tree = Some(tree);
+        self.tree_version = self.tree_version.wrapping_add(1);
+        self.current_scan_from_cache = from_cache;
+        self.expanded = expanded;
+        self.selected_node = Some(root_id);
+        self.treemap_root = Some(root_id);
+        self.treemap_hovered = None;
+        self.list_hovered = None;
+        self.lock_status = FileLockStatus::NotApplicable;
+        self.ext_filter = None;
+        self.denied_only_filter = false;
+        self.refresh_selection_cache();
+        self.rebuild_cached_views();
+    }
+
     pub fn start_scan(&mut self, target: ScanTarget, cx: &mut Context<Self>) {
         if let Some(prev) = self.cancel_token.take() {
             prev.store(true, Ordering::Relaxed);
@@ -208,9 +342,12 @@ impl Workspace {
 
         self.scan_seq = self.scan_seq.wrapping_add(1);
         let seq = self.scan_seq;
+        let cache_key = ScanCacheKey::from_target(&target);
+        let is_all_drives = matches!(target, ScanTarget::AllFixedDrives);
         self.selected_target = target.clone();
         self.scan_state = ScanState::Scanning(ScanProgress::default());
         self.toast_message = None;
+        self.current_scan_from_cache = false;
 
         // Immediately clear previous drive/target data so stale items never stay visible
         // while the newly selected target is being scanned.
@@ -223,6 +360,7 @@ impl Workspace {
         self.selected_has_fs_path = false;
         self.treemap_root = None;
         self.treemap_hovered = None;
+        self.list_hovered = None;
         self.visible_rows.clear();
         self.top_file_rows.clear();
         self.extension_rows.clear();
@@ -235,9 +373,10 @@ impl Workspace {
         let (tx, mut rx) = unbounded::<ScanEvent>();
         let volumes = self.volumes.clone();
         let sort = self.sort;
+        let scan_mode = self.settings.scan_mode;
         let prefer_mft = self.settings.prefer_ntfs_mft;
 
-        scanner::spawn_scan(target, volumes, sort, prefer_mft, cancel, tx);
+        scanner::spawn_scan(target, volumes, sort, scan_mode, prefer_mft, cancel, tx);
 
         cx.spawn(async move |this, cx| {
             while let Some(evt) = rx.next().await {
@@ -255,21 +394,22 @@ impl Workspace {
                         ScanEvent::Completed(tree) => {
                             this.cancel_token = None;
                             this.scan_state = ScanState::Ready;
-                            let root_id = tree.root;
-                            let mut expanded = HashSet::new();
-                            expanded.insert(root_id);
-                            this.tree = Some(Arc::new(tree));
-                            this.tree_version = this.tree_version.wrapping_add(1);
-                            this.expanded = expanded;
-                            this.selected_node = Some(root_id);
-                            this.treemap_root = Some(root_id);
-                            this.treemap_hovered = None;
-                            this.lock_status = FileLockStatus::NotApplicable;
-                            this.ext_filter = None;
-                            this.denied_only_filter = false;
-                            this.refresh_selection_cache();
-                            this.rebuild_cached_views();
+                            let arc_tree = Arc::new(tree);
+                            if is_all_drives {
+                                // Drop stale sub-volume entries previously extracted from an older Entire PC scan.
+                                this.scan_cache.retain(|_, v| !v.from_all_drives);
+                            }
+                            this.scan_cache.insert(
+                                cache_key.clone(),
+                                CachedScan {
+                                    tree: arc_tree.clone(),
+                                    scanned_at: Instant::now(),
+                                    from_all_drives: false,
+                                },
+                            );
+                            this.apply_loaded_tree(arc_tree, false);
                             this.volumes = platform::list_volumes();
+                            this.service_status = platform::query_service_status();
                             cx.notify();
                             should_stop = true;
                         }
@@ -348,6 +488,25 @@ impl Workspace {
     pub fn set_active_tab(&mut self, tab: MainTab, cx: &mut Context<Self>) {
         if self.active_tab != tab {
             self.active_tab = tab;
+            self.list_hovered = None;
+            cx.notify();
+        }
+    }
+
+    pub fn set_list_hovered(&mut self, node_id: NodeId, cx: &mut Context<Self>) {
+        if self.list_hovered != Some(node_id) {
+            self.list_hovered = Some(node_id);
+            cx.notify();
+        }
+    }
+
+    pub fn clear_list_hovered(&mut self, expected: Option<NodeId>, cx: &mut Context<Self>) {
+        let should_clear = match expected {
+            Some(id) => self.list_hovered == Some(id),
+            None => self.list_hovered.is_some(),
+        };
+        if should_clear {
+            self.list_hovered = None;
             cx.notify();
         }
     }
@@ -430,9 +589,21 @@ impl Workspace {
         }
 
         self.lock_status = FileLockStatus::Checking;
+        let use_service_locks = self.settings.scan_mode == ScanMode::Service
+            && self.service_status == ServiceStatus::Running
+            && !self.is_elevated;
         let (tx, mut rx) = unbounded::<FileLockStatus>();
         std::thread::spawn(move || {
-            let status = platform::inspect_file_lock(&path);
+            let mut status = platform::inspect_file_lock(&path);
+            if use_service_locks
+                && matches!(
+                    status,
+                    FileLockStatus::LockedUnknown | FileLockStatus::AccessDenied
+                )
+                && let Some(svc_status) = platform::inspect_file_lock_via_service(&path)
+            {
+                status = svc_status;
+            }
             let _ = tx.unbounded_send(status);
         });
 
@@ -640,6 +811,7 @@ impl Workspace {
                 path,
                 ..
             } => {
+                let trash_path = path.clone();
                 let (tx, mut rx) = unbounded::<Result<(), String>>();
                 std::thread::spawn(move || {
                     let res = platform::move_to_trash(&path);
@@ -659,8 +831,26 @@ impl Workspace {
                                     Arc::make_mut(tree).remove_subtree_soft(node_id);
                                     this.tree_version = this.tree_version.wrapping_add(1);
                                 }
+                                let current_key = ScanCacheKey::from_target(&this.selected_target);
+                                if let Some(tree) = this.tree.clone()
+                                    && let Some(entry) = this.scan_cache.get_mut(&current_key)
+                                {
+                                    entry.tree = tree;
+                                }
+                                for (k, entry) in this.scan_cache.iter_mut() {
+                                    if *k == current_key {
+                                        continue;
+                                    }
+                                    if let Some(other_id) =
+                                        entry.tree.find_node_by_path(&trash_path)
+                                    {
+                                        Arc::make_mut(&mut entry.tree)
+                                            .remove_subtree_soft(other_id);
+                                    }
+                                }
                                 this.selected_node = parent_id;
                                 this.treemap_hovered = None;
+                                this.list_hovered = None;
                                 this.lock_status = FileLockStatus::NotApplicable;
                                 this.refresh_selection_cache();
                                 this.rebuild_cached_views();
@@ -736,6 +926,102 @@ impl Workspace {
         self.settings.admin_prompt_shown = true;
         self.settings.save();
         cx.notify();
+    }
+
+    pub fn set_scan_mode(&mut self, mode: ScanMode, cx: &mut Context<Self>) {
+        if self.settings.scan_mode == mode {
+            return;
+        }
+        self.settings.scan_mode = mode;
+        if mode == ScanMode::Service {
+            self.settings.always_run_as_admin = false;
+        }
+        self.settings.save();
+        self.scan_cache.clear();
+        self.service_status = platform::query_service_status();
+        self.toast_message = Some((format!("Scan mode set to {}.", mode.label()), false));
+        cx.notify();
+    }
+
+    pub fn open_scanning_settings(&mut self, cx: &mut Context<Self>) {
+        self.pending_confirm = None;
+        self.settings_category = SettingsCategory::Scanning;
+        self.show_settings = true;
+        self.service_status = platform::query_service_status();
+        cx.notify();
+    }
+
+    pub fn refresh_service_status(&mut self, cx: &mut Context<Self>) {
+        self.service_status = platform::query_service_status();
+        cx.notify();
+    }
+
+    pub fn install_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action("install", cx);
+    }
+
+    pub fn start_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action("start", cx);
+    }
+
+    pub fn uninstall_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action("uninstall", cx);
+    }
+
+    fn run_service_action(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        if self.service_busy {
+            return;
+        }
+        self.service_busy = true;
+        cx.notify();
+
+        let (tx, mut rx) = unbounded::<Result<(), String>>();
+        std::thread::spawn(move || {
+            let res = match action {
+                "install" => platform::install_service_elevated(),
+                "start" => platform::start_service_elevated(),
+                "uninstall" => platform::uninstall_service_elevated(),
+                _ => Err("Unknown service action.".to_string()),
+            };
+            let _ = tx.unbounded_send(res);
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Some(res) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.service_busy = false;
+                    this.service_status = platform::query_service_status();
+                    this.scan_cache.clear();
+                    match res {
+                        Ok(()) => match action {
+                            "install" | "start" => {
+                                this.settings.scan_mode = ScanMode::Service;
+                                this.settings.always_run_as_admin = false;
+                                this.settings.save();
+                                this.toast_message = Some((
+                                    "TexTree MFT Service is active (no UAC needed).".to_string(),
+                                    false,
+                                ));
+                            }
+                            "uninstall" => {
+                                if this.settings.scan_mode == ScanMode::Service {
+                                    this.settings.scan_mode = ScanMode::AdminMft;
+                                    this.settings.save();
+                                }
+                                this.toast_message =
+                                    Some(("TexTree MFT Service uninstalled.".to_string(), false));
+                            }
+                            _ => {}
+                        },
+                        Err(err) => {
+                            this.toast_message = Some((err, true));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     pub fn dismiss_admin_banner(&mut self, cx: &mut Context<Self>) {
@@ -1341,7 +1627,38 @@ impl Workspace {
                         )
                     })
                     .when(cfg!(target_os = "windows"), |row| {
-                        if self.is_elevated {
+                        let service_active = self.settings.scan_mode == ScanMode::Service
+                            && self.service_status == ServiceStatus::Running;
+                        if service_active {
+                            row.child(
+                                h_flex()
+                                    .id("hdr-service-active")
+                                    .px_2()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(soft_tint(STATUS_SUCCESS, 0.14))
+                                    .border_1()
+                                    .border_color(soft_tint(STATUS_SUCCESS, 0.30))
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(STATUS_SUCCESS))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(soft_tint(STATUS_SUCCESS, 0.22)))
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(
+                                            "TexTree Read-Only MFT Service active: instant NTFS MFT scans, protected system folders, and elevated lock inspection without UAC prompts. Click to configure Scan Mode.",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_scanning_settings(cx);
+                                    }))
+                                    .child(Icon::new(LucideIcon::ShieldCheck).xsmall())
+                                    .child("Service · MFT"),
+                            )
+                        } else if self.is_elevated {
                             row.child(
                                 h_flex()
                                     .id("hdr-admin-active")
@@ -1356,12 +1673,17 @@ impl Workspace {
                                     .text_xs()
                                     .font_medium()
                                     .text_color(solid(STATUS_SUCCESS))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(soft_tint(STATUS_SUCCESS, 0.22)))
                                     .tooltip(|window, cx| {
                                         Tooltip::new(
-                                            "Running as Administrator: direct NTFS MFT scans, protected system folders, and elevated file-lock inspection are active.",
+                                            "Running as Administrator: direct NTFS MFT scans, protected system folders, and elevated file-lock inspection are active. Click to configure Scan Mode.",
                                         )
                                         .build(window, cx)
                                     })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_scanning_settings(cx);
+                                    }))
                                     .child(Icon::new(LucideIcon::ShieldCheck).xsmall())
                                     .child("Admin · MFT"),
                             )
@@ -1384,7 +1706,7 @@ impl Workspace {
                                     .hover(|s| s.bg(soft_tint(accent.primary_hex(), 0.22)))
                                     .tooltip(|window, cx| {
                                         Tooltip::new(
-                                            "Relaunch as Administrator for instant NTFS MFT scans, protected system folder visibility, and elevated file-lock detection.",
+                                            "Switch to Administrator Mode for instant NTFS MFT scans, protected system folders, and elevated file-lock detection (or install the zero-UAC MFT Service in Settings).",
                                         )
                                         .build(window, cx)
                                     })
@@ -1498,12 +1820,34 @@ impl Workspace {
                     )
                     .when_some(self.tree.as_ref(), |bar, tree| {
                         let root = tree.root_node();
+                        let from_cache = self.current_scan_from_cache;
                         bar.child(
                             h_flex()
                                 .items_center()
                                 .gap_3()
                                 .text_xs()
                                 .text_color(solid(TEXT_MUTED))
+                                .when(from_cache, |row| {
+                                    row.child(
+                                        div()
+                                            .id("subtab-cached-pill")
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded(px(RADIUS_CONTROL))
+                                            .bg(solid(BG_BASE))
+                                            .border_1()
+                                            .border_color(solid(BORDER_SUBTLE))
+                                            .text_xs()
+                                            .text_color(solid(TEXT_SECONDARY))
+                                            .tooltip(|window, cx| {
+                                                Tooltip::new(
+                                                    "Loaded instantly from session cache. Press F5 or click Scan to refresh from disk.",
+                                                )
+                                                .build(window, cx)
+                                            })
+                                            .child("Cached"),
+                                    )
+                                })
                                 .child(SharedString::from(format!(
                                     "Total: {}",
                                     format_size(root.logical_size, unit)
@@ -1619,10 +1963,10 @@ impl Workspace {
                     )
                 },
             )
-            // Contextual, dismissible Admin Mode benefit banner on Windows (non-elevated)
+            // Contextual, dismissible Admin/MFT benefit banner on Windows when MFT privileges are not active
             .when_some(
                 if cfg!(target_os = "windows")
-                    && !self.is_elevated
+                    && !self.has_mft_privileges()
                     && !self.dismissed_admin_banner
                     && !matches!(self.scan_state, ScanState::Scanning(_))
                 {
@@ -1756,7 +2100,13 @@ impl Workspace {
         if let ScanState::Scanning(p) = &self.scan_state {
             let target_label = self.selected_target.display_label();
             let engine_hint = if cfg!(target_os = "windows")
+                && self.settings.scan_mode == ScanMode::Service
+                && self.service_status == ServiceStatus::Running
+            {
+                "Reading NTFS Master File Table via TexTree MFT Service..."
+            } else if cfg!(target_os = "windows")
                 && self.is_elevated
+                && self.settings.scan_mode != ScanMode::Standard
                 && self.settings.prefer_ntfs_mft
             {
                 "Reading direct NTFS Master File Table and building storage tree..."
@@ -2127,6 +2477,7 @@ impl Render for Workspace {
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !*hovered {
                     this.clear_treemap_hover(cx);
+                    this.clear_list_hovered(None, cx);
                 }
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {

@@ -21,9 +21,15 @@ pub fn render_tree_table(ws: &Workspace, cx: &mut Context<Workspace>) -> impl In
     let row_count = ws.visible_rows.len();
 
     v_flex()
+        .id("tree-table-root")
         .size_full()
         .bg(solid(BG_BASE))
         .overflow_hidden()
+        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            if !*hovered {
+                this.clear_list_hovered(None, cx);
+            }
+        }))
         .child(render_table_header(ws, cx))
         .child(if row_count == 0 {
             v_flex()
@@ -317,6 +323,13 @@ fn render_tree_rows(
                     })
                     .hover(|s| s.bg(solid(BG_HOVER)))
                     .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.set_list_hovered(node_id, cx);
+                        } else {
+                            this.clear_list_hovered(Some(node_id), cx);
+                        }
+                    }))
                     .on_click(cx.listener(move |this, evt: &gpui_kit::ClickEvent, _, cx| {
                         this.select_node(node_id, cx);
                         if evt.click_count() >= 2 && has_children {

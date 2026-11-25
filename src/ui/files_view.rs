@@ -26,9 +26,15 @@ pub fn render_files_view(ws: &Workspace, cx: &mut Context<Workspace>) -> impl In
     let count = ws.top_file_rows.len();
 
     v_flex()
+        .id("top-files-root")
         .size_full()
         .bg(solid(BG_BASE))
         .overflow_hidden()
+        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            if !*hovered {
+                this.clear_list_hovered(None, cx);
+            }
+        }))
         // Filter strip for extension pill + inaccessible-only toggle
         .child(
             h_flex()
@@ -254,6 +260,13 @@ fn render_file_rows(
                     })
                     .hover(|s| s.bg(solid(BG_HOVER)))
                     .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.set_list_hovered(node_id, cx);
+                        } else {
+                            this.clear_list_hovered(Some(node_id), cx);
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_node(node_id, cx);
                     }))

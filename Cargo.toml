@@ -1,8 +1,17 @@
 [package]
 name = "textree"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Fast, minimalist flat-dark disk space analyzer built with Rust and GPUI-Kit"
+default-run = "textree"
+
+[[bin]]
+name = "textree"
+path = "src/main.rs"
+
+[[bin]]
+name = "textree-service"
+path = "src/bin/textree_service.rs"
 
 [dependencies]
 gpui-kit = "0.10.0"
@@ -36,9 +45,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_RestartManager",
+    "Win32_System_Services",
     "Win32_System_SystemServices",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

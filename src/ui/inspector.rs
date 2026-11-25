@@ -280,7 +280,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                 ))
                                 .when(
                                     cfg!(target_os = "windows")
-                                        && !ws.is_elevated
+                                        && !ws.has_mft_privileges()
                                         && (is_denied || node.denied_count > 0),
                                     |card| {
                                         card.child(
@@ -441,7 +441,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                 ))
                                 .child(render_attribute_badges(node.flags)),
                         )
-                        .child(render_lock_card(&ws.lock_status, ws.is_elevated, cx))
+                        .child(render_lock_card(&ws.lock_status, ws.has_mft_privileges(), cx))
                     })
                     .into_any_element()
             }

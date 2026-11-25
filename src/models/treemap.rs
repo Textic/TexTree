@@ -51,8 +51,6 @@ impl TreemapHeader {
 #[derive(Debug, Clone, Default)]
 pub struct TreemapLayout {
     pub root_id: NodeId,
-    pub width: f32,
-    pub height: f32,
     /// Renderable filled tiles (files, collapsed folders, and grouped small-file remainders).
     pub leaves: Vec<TreemapRect>,
     /// Structural container frames for depth 1-2 folder clusters (rendered with elevated plate + border).
@@ -71,8 +69,6 @@ impl TreemapLayout {
     ) -> Self {
         let mut layout = Self {
             root_id,
-            width,
-            height,
             leaves: Vec::with_capacity(512),
             frames: Vec::with_capacity(128),
             headers: Vec::with_capacity(32),
@@ -139,25 +135,62 @@ impl TreemapLayout {
         self.frames.iter().rev().copied().find(|r| r.contains(px, py))
     }
 
-    pub fn rect_for_node(&self, node_id: NodeId) -> Option<TreemapRect> {
+    /// Resolves the highlight bounding rectangle for any `node_id` hovered in the Tree View,
+    /// Top Files list, or Treemap itself:
+    /// 1. Direct frame (depth 1–2 folder/drive) or leaf tile match.
+    /// 2. Tight union bounding box of all rendered descendant leaves for deeper folders (depth 3–12).
+    /// 3. Immediate parent's small-file remainder tile if a tiny file was grouped into it.
+    pub fn highlight_rect_for_node(&self, tree: &DiskTree, node_id: NodeId) -> Option<TreemapRect> {
+        if node_id == self.root_id {
+            return None;
+        }
         if let Some(r) = self.frames.iter().find(|r| r.node_id == node_id) {
             return Some(*r);
         }
         if let Some(r) = self.leaves.iter().find(|r| r.node_id == node_id) {
             return Some(*r);
         }
-        if node_id == self.root_id && self.width > 0.0 && self.height > 0.0 {
-            return Some(TreemapRect {
-                node_id,
-                x: 0.0,
-                y: 0.0,
-                w: self.width,
-                h: self.height,
-                color_hex: 0x34d399,
-                is_container: true,
-                depth: 0,
-            });
+
+        let node = tree.get(node_id)?;
+        if node.is_container() {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            let mut found = false;
+
+            for leaf in &self.leaves {
+                if tree.is_ancestor(node_id, leaf.node_id) {
+                    min_x = min_x.min(leaf.x);
+                    min_y = min_y.min(leaf.y);
+                    max_x = max_x.max(leaf.x + leaf.w);
+                    max_y = max_y.max(leaf.y + leaf.h);
+                    found = true;
+                }
+            }
+            if found {
+                return Some(TreemapRect {
+                    node_id,
+                    x: min_x,
+                    y: min_y,
+                    w: (max_x - min_x).max(2.0),
+                    h: (max_y - min_y).max(2.0),
+                    color_hex: 0,
+                    is_container: true,
+                    depth: 3,
+                });
+            }
+        } else if let Some(pid) = node.parent {
+            // Tiny file folded into its parent's remainder bucket.
+            if let Some(rem) = self
+                .leaves
+                .iter()
+                .find(|r| r.is_container && r.node_id == pid)
+            {
+                return Some(*rem);
+            }
         }
+
         None
     }
 
@@ -728,5 +761,15 @@ mod tests {
         // Should have big_id tile PLUS remainder tile for the 2000 tiny files
         assert!(layout.leaves.iter().any(|l| l.node_id == big_id));
         assert!(layout.leaves.iter().any(|l| l.node_id == folder_id && l.is_container));
+
+        // Direct frame, direct leaf, and tiny-file remainder highlight resolution
+        let folder_rect = layout.highlight_rect_for_node(&tree, folder_id).unwrap();
+        assert!(folder_rect.w > 100.0 && folder_rect.h > 100.0);
+        let big_rect = layout.highlight_rect_for_node(&tree, big_id).unwrap();
+        assert_eq!(big_rect.node_id, big_id);
+        let tiny_file_id = big_id + 1;
+        let rem_rect = layout.highlight_rect_for_node(&tree, tiny_file_id).unwrap();
+        assert!(rem_rect.is_container && rem_rect.node_id == folder_id);
+        assert!(layout.highlight_rect_for_node(&tree, 0).is_none());
     }
 }

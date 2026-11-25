@@ -103,7 +103,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                         })
                         .hover(|s| s.bg(solid(BG_ELEVATED)))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.start_scan(ScanTarget::AllFixedDrives, cx);
+                            this.select_or_scan_target(ScanTarget::AllFixedDrives, cx);
                         }))
                         .child(
                             v_flex()
@@ -191,7 +191,10 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                     );
                     let frac = vol.used_fraction();
                     let bar_color = usage_bar_color(frac, accent);
-                    let vol_clone = vol.clone();
+                    let vol_target = ScanTarget::Volume(vol.clone());
+                    let is_cached = ws.has_cached_target(&vol_target);
+                    let vol_for_select = vol.clone();
+                    let vol_for_rescan = vol.clone();
                     let title = if vol.label.is_empty() {
                         vol.kind.label().to_string()
                     } else {
@@ -217,7 +220,10 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                         })
                         .hover(|s| s.bg(solid(BG_ELEVATED)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.start_scan(ScanTarget::Volume(vol_clone.clone()), cx);
+                            this.select_or_scan_target(
+                                ScanTarget::Volume(vol_for_select.clone()),
+                                cx,
+                            );
                         }))
                         .child(
                             v_flex()
@@ -261,21 +267,60 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                                         .child(SharedString::from(title)),
                                                 ),
                                         )
-                                        .when(!vol.file_system.is_empty(), |row| {
-                                            row.child(
-                                                div()
-                                                    .px_1()
-                                                    .rounded(px(3.))
-                                                    .bg(solid(BG_BASE))
-                                                    .border_1()
-                                                    .border_color(solid(BORDER_SUBTLE))
-                                                    .text_xs()
-                                                    .text_color(solid(TEXT_MUTED))
-                                                    .child(SharedString::from(
-                                                        vol.file_system.clone(),
-                                                    )),
-                                            )
-                                        }),
+                                        .child(
+                                            h_flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap_1()
+                                                .when(is_cached, |row| {
+                                                    row.child(
+                                                        div()
+                                                            .id(("sidebar-vol-rescan", idx))
+                                                            .w(px(18.))
+                                                            .h(px(18.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .rounded(px(3.))
+                                                            .text_color(solid(TEXT_MUTED))
+                                                            .hover(|s| {
+                                                                s.bg(solid(BG_HOVER)).text_color(
+                                                                    solid(TEXT_PRIMARY),
+                                                                )
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.start_scan(
+                                                                        ScanTarget::Volume(
+                                                                            vol_for_rescan.clone(),
+                                                                        ),
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                            .child(
+                                                                Icon::new(IconName::RefreshCw)
+                                                                    .xsmall(),
+                                                            ),
+                                                    )
+                                                })
+                                                .when(!vol.file_system.is_empty(), |row| {
+                                                    row.child(
+                                                        div()
+                                                            .px_1()
+                                                            .rounded(px(3.))
+                                                            .bg(solid(BG_BASE))
+                                                            .border_1()
+                                                            .border_color(solid(BORDER_SUBTLE))
+                                                            .text_xs()
+                                                            .text_color(solid(TEXT_MUTED))
+                                                            .child(SharedString::from(
+                                                                vol.file_system.clone(),
+                                                            )),
+                                                    )
+                                                }),
+                                        ),
                                 )
                                 .child(
                                     h_flex()
@@ -406,7 +451,10 @@ fn render_scan_summary_footer(ws: &Workspace) -> impl IntoElement {
                 ),
         )
         .when_some(engine_opt, |col, eng| {
-            let is_mft = matches!(eng, ScanEngineKind::NtfsMft | ScanEngineKind::Hybrid);
+            let is_mft = matches!(
+                eng,
+                ScanEngineKind::NtfsMft | ScanEngineKind::NtfsMftService | ScanEngineKind::Hybrid
+            );
             col.child(
                 h_flex()
                     .justify_between()

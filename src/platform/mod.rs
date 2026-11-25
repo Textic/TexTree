@@ -1,5 +1,6 @@
 pub mod elevation;
 pub mod locks;
+pub mod service_client;
 pub mod volumes;
 
 use std::path::Path;
@@ -7,6 +8,11 @@ use std::process::Command;
 
 pub use elevation::{is_elevated, relaunch_as_admin};
 pub use locks::{FileLockStatus, inspect_file_lock};
+pub use service_client::{
+    ServiceStatus, find_service_exe, inspect_file_lock_via_service, install_service_elevated,
+    query_service_status, scan_volume_via_service, start_service_elevated,
+    uninstall_service_elevated,
+};
 pub use volumes::{cluster_size_for_path, list_volumes};
 
 /// Opens the OS file manager and highlights `path`.

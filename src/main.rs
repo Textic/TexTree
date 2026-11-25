@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod mft_raw;
 mod models;
 mod platform;
 mod scanner;
+mod service_protocol;
 mod theme;
 mod ui;
 mod updater;
@@ -15,6 +17,8 @@ use gpui_kit::{
 };
 
 use crate::models::AppSettings;
+#[cfg(target_os = "windows")]
+use crate::models::ScanMode;
 use crate::ui::workspace::{
     CancelOrDismiss, FocusSearch, OpenSettings, PickFolder, Quit, Rescan, ToggleInspector,
     ToggleSidebar, ToggleTreemap, Workspace,
@@ -71,10 +75,20 @@ impl AssetSource for TexTreeAssets {
 }
 
 fn main() {
-    let initial_settings = AppSettings::load();
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut initial_settings = AppSettings::load();
+
+    // On a fresh install where the Windows MFT Service is already running, default straight into Service mode.
+    #[cfg(target_os = "windows")]
+    if !AppSettings::config_path().exists()
+        && platform::query_service_status() == platform::ServiceStatus::Running
+    {
+        initial_settings.scan_mode = ScanMode::Service;
+    }
 
     #[cfg(target_os = "windows")]
     if initial_settings.always_run_as_admin
+        && initial_settings.scan_mode != ScanMode::Service
         && !platform::is_elevated()
         && !std::env::args().any(|arg| arg == "--no-auto-elevate")
         && platform::relaunch_as_admin().is_ok()

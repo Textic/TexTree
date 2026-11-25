@@ -17,7 +17,7 @@ use gpui_kit::{
 use crate::models::{DiskTree, NodeId, SizeUnit, TreemapLayout};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, TEXT_MUTED, TEXT_PRIMARY,
-    TEXT_SECONDARY, format_size, solid,
+    TEXT_SECONDARY, format_size, soft_tint, solid,
 };
 use crate::ui::workspace::Workspace;
 
@@ -83,7 +83,13 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
     }
     crumbs.reverse();
 
-    let hover_info: Option<(SharedString, SharedString)> = ws.treemap_hovered.and_then(|hid| {
+    let active_hover = ws
+        .treemap_hovered
+        .or(ws.list_hovered)
+        .filter(|&hid| hid != treemap_root);
+    let hover_from_list = ws.treemap_hovered.is_none() && active_hover.is_some();
+
+    let hover_info: Option<(SharedString, SharedString)> = active_hover.and_then(|hid| {
         let node = tree.get(hid)?;
         let path = tree
             .full_path(hid)
@@ -107,10 +113,11 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
 
     let cache_for_canvas: Rc<RefCell<TreemapCanvasCache>> = ws.treemap_cache.clone();
     let cache_for_paint = ws.treemap_cache.clone();
-    let tree_for_prepaint: Arc<DiskTree> = tree;
+    let tree_for_prepaint: Arc<DiskTree> = tree.clone();
+    let tree_for_paint: Arc<DiskTree> = tree;
     let tree_version = ws.tree_version;
     let selected_node = ws.selected_node;
-    let hovered_node = ws.treemap_hovered;
+    let hovered_node = active_hover;
     let accent_hex = accent.primary_hex();
 
     v_flex()
@@ -490,7 +497,8 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                             // 5. Selected node highlight (2px accent border; skip outer rim when root is selected)
                             if let Some(sel_id) = selected_node
                                 && sel_id != treemap_root
-                                && let Some(sel) = cache.layout.rect_for_node(sel_id)
+                                && let Some(sel) =
+                                    cache.layout.highlight_rect_for_node(&tree_for_paint, sel_id)
                             {
                                 let rect = Bounds {
                                     origin: point(px(ox + sel.x), px(oy + sel.y)),
@@ -509,9 +517,10 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                 });
                             }
 
-                            // 6. Hovered tile/folder highlight
+                            // 6. Hovered tile/folder highlight (works both from Treemap mouseover and Tree/Files list hover)
                             if let Some(hov_id) = hovered_node
-                                && let Some(hov) = cache.layout.rect_for_node(hov_id)
+                                && let Some(hov) =
+                                    cache.layout.highlight_rect_for_node(&tree_for_paint, hov_id)
                             {
                                 let rect = Bounds {
                                     origin: point(px(ox + hov.x), px(oy + hov.y)),
@@ -523,8 +532,16 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                 window.paint_quad(PaintQuad {
                                     bounds: rect,
                                     corner_radii: (0.).into(),
-                                    background: hsla(0., 0., 1., 0.14).into(),
-                                    border_widths: px(1.).into(),
+                                    background: if hover_from_list {
+                                        soft_tint(accent_hex, 0.22).into()
+                                    } else {
+                                        hsla(0., 0., 1., 0.16).into()
+                                    },
+                                    border_widths: if hover_from_list {
+                                        px(2.).into()
+                                    } else {
+                                        px(1.5).into()
+                                    },
                                     border_color: solid(TEXT_PRIMARY),
                                     border_style: BorderStyle::Solid,
                                 });

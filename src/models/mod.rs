@@ -3,7 +3,7 @@ pub mod tree;
 pub mod treemap;
 pub mod volume;
 
-pub use settings::{AccentPreset, AppSettings, SizeUnit};
+pub use settings::{AccentPreset, AppSettings, ScanMode, SizeUnit};
 pub use tree::{
     DiskTree, ExtensionStat, FileNode, NodeFlags, NodeId, ScanEngineKind, SortColumn, SortSpec,
     VisibleRow,

@@ -100,6 +100,7 @@ pub enum ScanEngineKind {
     #[default]
     ParallelWalk,
     NtfsMft,
+    NtfsMftService,
     Hybrid,
 }
 
@@ -108,6 +109,7 @@ impl ScanEngineKind {
         match self {
             Self::ParallelWalk => "Parallel Walk",
             Self::NtfsMft => "NTFS MFT",
+            Self::NtfsMftService => "MFT Service",
             Self::Hybrid => "MFT + Parallel",
         }
     }
@@ -621,6 +623,161 @@ impl DiskTree {
         result
     }
 
+    /// Returns `true` if `ancestor` is an ancestor of (or equal to) `descendant`.
+    #[inline]
+    pub fn is_ancestor(&self, ancestor: NodeId, descendant: NodeId) -> bool {
+        let mut cur = Some(descendant);
+        let mut guard = 0usize;
+        while let Some(id) = cur {
+            if id == ancestor {
+                return true;
+            }
+            guard += 1;
+            if guard > 512 {
+                break;
+            }
+            cur = self.get(id).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    /// Finds a direct volume child matching `root_path` under a virtual root (e.g. `This PC`).
+    pub fn find_volume_child(&self, root_path: &std::path::Path) -> Option<NodeId> {
+        let needle = normalize_cmp_path(&root_path.to_string_lossy());
+        for &cid in &self.root_node().children {
+            let child = self.get(cid)?;
+            if child.removed || !child.flags.contains(NodeFlags::IS_VOLUME) {
+                continue;
+            }
+            if normalize_cmp_path(child.name.as_ref()) == needle {
+                return Some(cid);
+            }
+        }
+        None
+    }
+
+    /// Locates a non-removed node in this tree matching `target_path` by walking down segments.
+    pub fn find_node_by_path(&self, target_path: &std::path::Path) -> Option<NodeId> {
+        let target_str = target_path.to_string_lossy();
+        let target_norm = normalize_cmp_path(&target_str);
+        if target_norm.is_empty() {
+            return None;
+        }
+
+        let (mut cur_id, remainder) = if self.root_node().flags.contains(NodeFlags::IS_VIRTUAL) {
+            let mut matched = None;
+            for &cid in &self.root_node().children {
+                let Some(child) = self.get(cid) else {
+                    continue;
+                };
+                if child.removed {
+                    continue;
+                }
+                let vol_norm = normalize_cmp_path(child.name.as_ref());
+                if target_norm == vol_norm {
+                    return Some(cid);
+                }
+                if let Some(rest) = target_norm.strip_prefix(&vol_norm)
+                    && (rest.starts_with('/') || vol_norm.ends_with('/'))
+                {
+                    matched = Some((cid, rest.trim_start_matches('/')));
+                    break;
+                }
+            }
+            matched?
+        } else {
+            let root_str = self
+                .root_base_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.root_node().name.to_string());
+            let root_norm = normalize_cmp_path(&root_str);
+            if target_norm == root_norm {
+                return Some(self.root);
+            }
+            let rest = target_norm.strip_prefix(&root_norm)?;
+            if !rest.starts_with('/') && !root_norm.ends_with('/') {
+                return None;
+            }
+            (self.root, rest.trim_start_matches('/'))
+        };
+
+        for seg in remainder.split('/').filter(|s| !s.is_empty()) {
+            let next = self.get(cur_id)?.children.iter().copied().find(|&cid| {
+                let Some(c) = self.get(cid) else {
+                    return false;
+                };
+                !c.removed && c.name.as_ref().eq_ignore_ascii_case(seg)
+            })?;
+            cur_id = next;
+        }
+        Some(cur_id)
+    }
+
+    /// Extracts an independent `DiskTree` rooted at `sub_root` (used for instant cached
+    /// switching from `Entire PC` into an individual drive without re-reading disk).
+    pub fn extract_subtree(
+        &self,
+        sub_root: NodeId,
+        target_label: impl Into<String>,
+        root_base_path: Option<PathBuf>,
+    ) -> Option<DiskTree> {
+        let root_src = self.get(sub_root)?;
+        if root_src.removed {
+            return None;
+        }
+
+        let est_nodes = root_src
+            .total_items()
+            .saturating_add(1)
+            .min(self.nodes.len() as u64) as usize;
+        let mut new_nodes: Vec<FileNode> = Vec::with_capacity(est_nodes.max(16));
+        let mut stack: Vec<(NodeId, Option<NodeId>)> = Vec::with_capacity(64);
+        stack.push((sub_root, None));
+
+        while let Some((old_id, new_parent)) = stack.pop() {
+            let src = &self.nodes[old_id as usize];
+            if src.removed {
+                continue;
+            }
+            let new_id = new_nodes.len() as NodeId;
+            if let Some(pid) = new_parent {
+                new_nodes[pid as usize].children.push(new_id);
+            }
+            let child_count = src.children.len();
+            new_nodes.push(FileNode {
+                name: src.name.clone(),
+                parent: new_parent,
+                children: Vec::with_capacity(child_count),
+                logical_size: src.logical_size,
+                allocated_size: src.allocated_size,
+                file_count: src.file_count,
+                dir_count: src.dir_count,
+                denied_count: src.denied_count,
+                modified_secs: src.modified_secs,
+                flags: src.flags,
+                ext_id: src.ext_id,
+                removed: false,
+            });
+            // Push in reverse so children are visited and pushed into `new_nodes[new_id].children` in original sorted order.
+            for &cid in src.children.iter().rev() {
+                if !self.nodes[cid as usize].removed {
+                    stack.push((cid, Some(new_id)));
+                }
+            }
+        }
+
+        Some(DiskTree {
+            root: 0,
+            root_base_path,
+            nodes: new_nodes,
+            extensions: self.extensions.clone(),
+            scan_duration_ms: self.scan_duration_ms,
+            target_label: target_label.into(),
+            engine: self.engine,
+        })
+    }
+
     /// Marks `id` and all its descendants as removed and subtracts their totals up the parent chain.
     pub fn remove_subtree_soft(&mut self, id: NodeId) -> bool {
         if id == self.root {
@@ -943,5 +1100,33 @@ mod tests {
             .map(|&id| tree.nodes[id as usize].name.as_ref())
             .collect();
         assert_eq!(drive_names, vec!["C:\\", "D:\\", "E:\\", "X:\\"]);
+
+        // Test volume lookup, subtree extraction, path lookup, and ancestry.
+        let e_id = tree.find_volume_child(std::path::Path::new("E:\\")).unwrap();
+        let e_tree = tree
+            .extract_subtree(e_id, "Local Disk (E:)", Some(PathBuf::from("E:\\")))
+            .unwrap();
+        assert_eq!(e_tree.root_node().name.as_ref(), "E:\\");
+        assert_eq!(e_tree.root_node().logical_size, 900);
+        assert_eq!(e_tree.root_node().file_count, 1);
+
+        let e_file_in_all = tree
+            .find_node_by_path(std::path::Path::new("E:\\data.bin"))
+            .unwrap();
+        assert!(tree.is_ancestor(e_id, e_file_in_all));
+        assert!(!tree.is_ancestor(e_file_in_all, e_id));
+
+        let e_file_in_sub = e_tree
+            .find_node_by_path(std::path::Path::new("E:\\data.bin"))
+            .unwrap();
+        assert_eq!(e_tree.get(e_file_in_sub).unwrap().logical_size, 900);
     }
+}
+
+fn normalize_cmp_path(raw: &str) -> String {
+    let mut s = raw.replace('\\', "/").to_ascii_lowercase();
+    while s.len() > 1 && s.ends_with('/') && !s.ends_with(":/") {
+        s.pop();
+    }
+    s
 }

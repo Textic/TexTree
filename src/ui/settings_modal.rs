@@ -12,11 +12,12 @@ use gpui_kit::{
     div, hsla, prelude::*, px, relative,
 };
 
-use crate::models::{AccentPreset, NodeId, SizeUnit};
+use crate::models::{AccentPreset, NodeId, ScanMode, SizeUnit};
+use crate::platform::{self, ServiceStatus};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
-    STATUS_ERROR, STATUS_SUCCESS, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, format_count,
-    format_size, render_app_badge, soft_tint, solid,
+    STATUS_ERROR, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    format_count, format_size, render_app_badge, soft_tint, solid,
 };
 use crate::ui::workspace::Workspace;
 use crate::updater::{CURRENT_VERSION, REPO_URL, UpdateState, format_download_bytes};
@@ -227,6 +228,20 @@ pub fn render_confirm_modal(
                                     .child(
                                         "This prompt is only shown once. You can change this later in Settings → Scanning & Safety.",
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-admin-open-service")
+                                    .pt_0p5()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(accent_hex))
+                                    .hover(|s| s.text_color(solid(TEXT_PRIMARY)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_scanning_settings(cx);
+                                    }))
+                                    .child("Prefer zero UAC prompts? Set up the read-only MFT Service in Settings →"),
                             ),
                     )
                     .child(
@@ -693,18 +708,308 @@ fn render_appearance_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl I
 }
 
 fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
+    let accent = ws.settings.accent;
     let show_hidden = ws.settings.show_hidden_files;
     let confirm_trash = ws.settings.confirm_before_trash;
     let auto_scan = ws.settings.auto_scan_on_launch;
     let show_treemap = ws.settings.show_treemap;
     let prefer_mft = ws.settings.prefer_ntfs_mft;
     let always_admin = ws.settings.always_run_as_admin;
+    let active_mode = ws.settings.scan_mode;
     let auto_check = ws.settings.auto_check_updates;
     let is_elevated = ws.is_elevated;
+    let service_status = ws.service_status;
+    let service_busy = ws.service_busy;
+    let has_service_bin = platform::find_service_exe().is_some();
 
     v_flex()
         .w_full()
         .gap_3()
+        .when(cfg!(target_os = "windows"), |col| {
+            let status_color = match service_status {
+                ServiceStatus::Running => STATUS_SUCCESS,
+                ServiceStatus::Stopped => STATUS_WARNING,
+                ServiceStatus::NotInstalled | ServiceStatus::Unavailable => TEXT_MUTED,
+            };
+
+            col.child(
+                section_card("Scan Mode & Privileges")
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_1p5()
+                            .children(ScanMode::ALL.into_iter().enumerate().map(|(ix, mode)| {
+                                let is_selected = mode == active_mode;
+                                let badge: Option<(&'static str, u32)> = match mode {
+                                    ScanMode::Service => Some((
+                                        if service_status == ServiceStatus::Running {
+                                            "Active"
+                                        } else {
+                                            "Recommended"
+                                        },
+                                        if service_status == ServiceStatus::Running {
+                                            STATUS_SUCCESS
+                                        } else {
+                                            accent.primary_hex()
+                                        },
+                                    )),
+                                    ScanMode::AdminMft if is_elevated => {
+                                        Some(("Elevated", STATUS_SUCCESS))
+                                    }
+                                    ScanMode::AdminMft => Some(("Portable", TEXT_MUTED)),
+                                    ScanMode::Standard => Some(("No Admin", TEXT_MUTED)),
+                                };
+
+                                div()
+                                    .id(("scan-mode-opt", ix))
+                                    .w_full()
+                                    .p_2p5()
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .cursor_pointer()
+                                    .bg(if is_selected {
+                                        soft_tint(accent.primary_hex(), 0.10)
+                                    } else {
+                                        solid(BG_BASE)
+                                    })
+                                    .border_1()
+                                    .border_color(if is_selected {
+                                        solid(accent.primary_hex())
+                                    } else {
+                                        solid(BORDER_SUBTLE)
+                                    })
+                                    .hover(|s| s.bg(solid(BG_HOVER)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_scan_mode(mode, cx);
+                                    }))
+                                    .child(
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .gap_2()
+                                                    .child(
+                                                        h_flex()
+                                                            .items_center()
+                                                            .gap_1p5()
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .font_semibold()
+                                                                    .text_color(solid(TEXT_PRIMARY))
+                                                                    .child(mode.label()),
+                                                            )
+                                                            .when_some(badge, |r, (lbl, col_hex)| {
+                                                                r.child(
+                                                                    div()
+                                                                        .px_1p5()
+                                                                        .py_0p5()
+                                                                        .rounded(px(3.))
+                                                                        .bg(soft_tint(
+                                                                            col_hex, 0.14,
+                                                                        ))
+                                                                        .text_xs()
+                                                                        .text_color(solid(col_hex))
+                                                                        .child(lbl),
+                                                                )
+                                                            }),
+                                                    )
+                                                    .when(is_selected, |r| {
+                                                        r.child(
+                                                            Icon::new(IconName::Check)
+                                                                .xsmall()
+                                                                .text_color(solid(
+                                                                    accent.primary_hex(),
+                                                                )),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(solid(TEXT_MUTED))
+                                                    .child(mode.description()),
+                                            ),
+                                    )
+                            })),
+                    )
+                    // Background MFT Service lifecycle controls
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_2()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(solid(BG_BASE))
+                            .border_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                Icon::new(LucideIcon::ShieldCheck)
+                                                    .small()
+                                                    .text_color(solid(status_color)),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        h_flex()
+                                                            .items_center()
+                                                            .gap_1p5()
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .font_semibold()
+                                                                    .text_color(solid(TEXT_PRIMARY))
+                                                                    .child("TexTree Read-Only MFT Service"),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .px_1p5()
+                                                                    .py_0p5()
+                                                                    .rounded(px(3.))
+                                                                    .bg(soft_tint(
+                                                                        status_color, 0.14,
+                                                                    ))
+                                                                    .text_xs()
+                                                                    .text_color(solid(status_color))
+                                                                    .child(service_status.label()),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(solid(TEXT_MUTED))
+                                                            .child(if has_service_bin {
+                                                                "On-demand read-only service (~4 MB idle, 0% CPU). Installs once with UAC; zero prompts thereafter."
+                                                            } else {
+                                                                "Place textree-service.exe next to textree.exe (or run the Windows installer) to enable Service mode."
+                                                            }),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("set-svc-refresh")
+                                            .with_size(Size::XSmall)
+                                            .ghost()
+                                            .icon(IconName::RefreshCw)
+                                            .tooltip("Refresh Service Status")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.refresh_service_status(cx);
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .when(service_status == ServiceStatus::NotInstalled, |row| {
+                                        row.child(
+                                            Button::new("set-svc-install")
+                                                .with_size(Size::XSmall)
+                                                .primary()
+                                                .disabled(service_busy || !has_service_bin)
+                                                .icon(LucideIcon::ShieldCheck)
+                                                .label(if service_busy {
+                                                    "Installing..."
+                                                } else {
+                                                    "Install & Enable Service"
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.install_mft_service(cx);
+                                                })),
+                                        )
+                                    })
+                                    .when(service_status == ServiceStatus::Stopped, |row| {
+                                        row.child(
+                                            Button::new("set-svc-start")
+                                                .with_size(Size::XSmall)
+                                                .primary()
+                                                .disabled(service_busy || !has_service_bin)
+                                                .label(if service_busy {
+                                                    "Starting..."
+                                                } else {
+                                                    "Start Service"
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.start_mft_service(cx);
+                                                })),
+                                        )
+                                    })
+                                    .when(
+                                        matches!(
+                                            service_status,
+                                            ServiceStatus::Running | ServiceStatus::Stopped
+                                        ),
+                                        |row| {
+                                            row.child(
+                                                Button::new("set-svc-uninstall")
+                                                    .with_size(Size::XSmall)
+                                                    .secondary()
+                                                    .disabled(service_busy || !has_service_bin)
+                                                    .label(if service_busy {
+                                                        "Working..."
+                                                    } else {
+                                                        "Uninstall Service"
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.uninstall_mft_service(cx);
+                                                    })),
+                                            )
+                                        },
+                                    ),
+                            ),
+                    )
+                    // Portable UAC Admin Mode controls
+                    .child(
+                        v_flex()
+                            .pt_1()
+                            .gap_2()
+                            .border_t_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(
+                                        Checkbox::new("set-always-admin")
+                                            .checked(always_admin)
+                                            .label(
+                                                "Always request Administrator Mode on launch (UAC mode only)",
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_always_run_as_admin(cx);
+                                            })),
+                                    )
+                                    .when(!is_elevated, |row| {
+                                        row.child(
+                                            Button::new("set-relaunch-admin")
+                                                .with_size(Size::XSmall)
+                                                .secondary()
+                                                .label("Relaunch as Admin")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.relaunch_as_admin(cx);
+                                                })),
+                                        )
+                                    }),
+                            ),
+                    ),
+            )
+        })
         .child(
             section_card("Behavior & Safety")
                 .child(
@@ -756,72 +1061,6 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                         })),
                 ),
         )
-        .when(cfg!(target_os = "windows"), |col| {
-            col.child(
-                section_card("Administrator Mode & Privileges")
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .child(
-                                v_flex()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(if is_elevated {
-                                                solid(STATUS_SUCCESS)
-                                            } else {
-                                                solid(TEXT_PRIMARY)
-                                            })
-                                            .child(if is_elevated {
-                                                "Running as Administrator — Fast NTFS MFT & full access active"
-                                            } else {
-                                                "Running as Standard User — Parallel Win32 mode"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(solid(TEXT_MUTED))
-                                            .child(
-                                                "Admin Mode unlocks instant direct NTFS MFT scans, protected system folders, and elevated file-lock inspection.",
-                                            ),
-                                    ),
-                            )
-                            .when(!is_elevated, |row| {
-                                row.child(
-                                    Button::new("set-relaunch-admin")
-                                        .with_size(Size::XSmall)
-                                        .primary()
-                                        .label("Relaunch as Admin")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.relaunch_as_admin(cx);
-                                        })),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .pt_1()
-                            .border_t_1()
-                            .border_color(solid(BORDER_SUBTLE))
-                            .child(
-                                Checkbox::new("set-always-admin")
-                                    .checked(always_admin)
-                                    .label(
-                                        "Always request Administrator Mode on launch (shows Windows UAC prompt)",
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_always_run_as_admin(cx);
-                                    })),
-                            ),
-                    ),
-            )
-        })
 }
 
 fn render_updates_about_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
