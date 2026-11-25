@@ -4,7 +4,7 @@
 use gpui_kit::{
     Context, MouseButton, MouseDownEvent, Pixels, Point, SharedString, Window,
     assets::IconName as LucideIcon,
-    component::{Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex},
+    component::{Icon, IconName, Sizable as _, h_flex, v_flex},
     div, prelude::*, px,
 };
 
