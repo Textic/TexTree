@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <circle cx="256" cy="256" r="236" fill="#09090B" stroke="#27272A" stroke-width="10"/>
+  <circle cx="256" cy="256" r="196" fill="#111113"/>
+  <!-- Tree trunk & hierarchical storage bars -->
+  <line x1="158" y1="146" x2="158" y2="364" stroke="#A1A1AA" stroke-width="22" stroke-linecap="round"/>
+  <!-- Branch 1 (largest bar, emerald accent) -->
+  <line x1="158" y1="176" x2="212" y2="176" stroke="#A1A1AA" stroke-width="20" stroke-linecap="round"/>
+  <rect x="212" y="150" width="166" height="52" rx="12" fill="#34D399"/>
+  <!-- Branch 2 (medium bar) -->
+  <line x1="158" y1="256" x2="212" y2="256" stroke="#A1A1AA" stroke-width="20" stroke-linecap="round"/>
+  <rect x="212" y="230" width="122" height="52" rx="12" fill="#F4F4F5"/>
+  <!-- Branch 3 (smaller bar) -->
+  <line x1="158" y1="336" x2="212" y2="336" stroke="#A1A1AA" stroke-width="20" stroke-linecap="round"/>
+  <rect x="212" y="310" width="80" height="52" rx="12" fill="#71717A"/>
+  <!-- Root node dot -->
+  <circle cx="158" cy="146" r="20" fill="#34D399"/>
+</svg>

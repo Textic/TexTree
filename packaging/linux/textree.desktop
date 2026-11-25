@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TexTree
+Comment=Minimalist flat-dark disk space analyzer
+Exec=textree
+Icon=textree
+Terminal=false
+Categories=System;Utility;FileTools;
+StartupWMClass=textree

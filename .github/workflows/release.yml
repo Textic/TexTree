@@ -1,0 +1,227 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  prepare:
+    name: Compute Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      already_tagged: ${{ steps.ver.outputs.already_tagged }}
+      cargo_version: ${{ steps.ver.outputs.cargo_version }}
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - name: Checkout repository with full tag history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve next SemVer tag
+        id: ver
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content -Path "Cargo.toml" -Raw
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+            throw "Could not parse package version from Cargo.toml"
+          }
+          $major = [int]$Matches[1]
+          $minor = [int]$Matches[2]
+          $basePatch = [int]$Matches[3]
+          $cargoVersion = "$major.$minor.$basePatch"
+
+          $headTags = @(git tag --points-at HEAD "v*" | Where-Object { $_ -ne "" })
+          if ($headTags.Count -gt 0 -and "${{ github.event_name }}" -eq "push") {
+            Write-Output "already_tagged=true" >> $env:GITHUB_OUTPUT
+            Write-Output "cargo_version=$cargoVersion" >> $env:GITHUB_OUTPUT
+            Write-Output "version=$cargoVersion" >> $env:GITHUB_OUTPUT
+            Write-Output "tag=$($headTags[0])" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          $prefix = "v$major.$minor."
+          $existingTags = @(git tag --list "${prefix}*" | Where-Object { $_ -ne "" })
+          if ($existingTags.Count -eq 0) {
+            $nextPatch = $basePatch
+          } else {
+            $maxPatch = -1
+            foreach ($t in $existingTags) {
+              if ($t -match "^v$major\.$minor\.(\d+)$") {
+                $p = [int]$Matches[1]
+                if ($p -gt $maxPatch) { $maxPatch = $p }
+              }
+            }
+            $nextPatch = [Math]::Max($basePatch, $maxPatch + 1)
+          }
+
+          $nextVersion = "$major.$minor.$nextPatch"
+          $nextTag = "v$nextVersion"
+
+          Write-Host "Resolved release version: $nextVersion (tag: $nextTag)"
+          Write-Output "already_tagged=false" >> $env:GITHUB_OUTPUT
+          Write-Output "cargo_version=$cargoVersion" >> $env:GITHUB_OUTPUT
+          Write-Output "version=$nextVersion" >> $env:GITHUB_OUTPUT
+          Write-Output "tag=$nextTag" >> $env:GITHUB_OUTPUT
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: prepare
+    if: needs.prepare.outputs.already_tagged != 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: linux-x86_64
+            os: linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux system libraries
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config cmake clang dpkg-dev \
+            libssl-dev libfontconfig1-dev libfreetype-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libvulkan-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup sccache (Unix)
+        if: matrix.os != 'windows'
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Enable sccache env (Unix)
+        if: matrix.os != 'windows'
+        run: |
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+
+      - name: Restore Cargo cache (Windows)
+        if: matrix.os == 'windows'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+
+      - name: Sync build version in runner Cargo.toml (Windows)
+        if: matrix.os == 'windows' && needs.prepare.outputs.version != needs.prepare.outputs.cargo_version
+        shell: pwsh
+        run: |
+          $raw = Get-Content -Path "Cargo.toml" -Raw
+          $updated = $raw -replace '(?m)^(version\s*=\s*")\d+\.\d+\.\d+(")', "`${1}${{ needs.prepare.outputs.version }}`${2}"
+          Set-Content -Path "Cargo.toml" -Value $updated -NoNewline
+
+      - name: Sync build version in runner Cargo.toml (Unix)
+        if: matrix.os != 'windows' && needs.prepare.outputs.version != needs.prepare.outputs.cargo_version
+        run: |
+          python3 -c 'import pathlib, re; p = pathlib.Path("Cargo.toml"); p.write_text(re.sub(r"(?m)^(version\s*=\s*\")\d+\.\d+\.\d+(\")", r"\g<1>${{ needs.prepare.outputs.version }}\g<2>", p.read_text()))'
+
+      - name: Test, build & package Windows installer
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          cargo test --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }}
+          & .\packaging\windows\build-setup.ps1 `
+            -BinaryPath "target\${{ matrix.target }}\release\textree.exe" `
+            -Version "${{ needs.prepare.outputs.version }}" `
+            -Tag "${{ needs.prepare.outputs.tag }}" `
+            -OutDir "dist"
+
+      - name: Test, build & package Linux .deb + tarball
+        if: matrix.os == 'linux'
+        run: |
+          cargo test --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }}
+          bash packaging/linux/build-deb.sh \
+            "target/${{ matrix.target }}/release/textree" \
+            "${{ needs.prepare.outputs.version }}" \
+            "${{ needs.prepare.outputs.tag }}" \
+            "dist"
+
+      - name: Test, build & package macOS .dmg + .zip
+        if: matrix.os == 'macos'
+        run: |
+          cargo test --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }}
+          bash packaging/macos/build-dmg.sh \
+            "target/${{ matrix.target }}/release/textree" \
+            "${{ needs.prepare.outputs.version }}" \
+            "${{ needs.prepare.outputs.tag }}" \
+            "${{ matrix.name }}" \
+            "dist"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.name }}
+          path: dist/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.already_tagged != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-assets-*
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "TexTree $TAG" \
+            --generate-notes \
+            dist/*

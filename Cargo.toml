@@ -1,0 +1,44 @@
+[package]
+name = "textree"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, minimalist flat-dark disk space analyzer built with Rust and GPUI-Kit"
+
+[dependencies]
+gpui-kit = "0.10.0"
+rayon = "1.10"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "native-tls",
+    "charset",
+    "http2",
+    "system-proxy",
+    "json",
+    "stream",
+    "gzip",
+    "brotli",
+    "deflate",
+] }
+futures-channel = "0.3"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bitflags = "2.6"
+chrono = "0.4"
+dirs = "6.0"
+anyhow = "1.0"
+sha2 = "0.10"
+trash = "5.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_RestartManager",
+    "Win32_System_SystemServices",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres = "0.3"
