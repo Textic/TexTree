@@ -235,13 +235,22 @@ fn render_file_rows(
                     .id(("top-file-row", ix))
                     .w_full()
                     .h(px(ROW_HEIGHT))
+                    .relative()
                     .px_2()
                     .items_center()
                     .bg(row_bg)
                     .border_b_1()
                     .border_color(solid(BORDER_SUBTLE))
                     .when(is_selected, |r| {
-                        r.border_l_2().border_color(solid(accent.primary_hex()))
+                        r.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(2.))
+                                .bg(solid(accent.primary_hex())),
+                        )
                     })
                     .hover(|s| s.bg(solid(BG_HOVER)))
                     .cursor_pointer()
@@ -293,11 +302,9 @@ fn render_file_rows(
                             .child(
                                 div()
                                     .flex_1()
-                                    .h(px(6.))
+                                    .h(px(5.))
                                     .rounded(px(2.))
-                                    .bg(solid(BG_BASE))
-                                    .border_1()
-                                    .border_color(solid(BORDER_SUBTLE))
+                                    .bg(solid(BG_ELEVATED))
                                     .overflow_hidden()
                                     .child(
                                         div()

@@ -17,7 +17,7 @@ use gpui_kit::{
 use crate::models::AppSettings;
 use crate::ui::workspace::{
     CancelOrDismiss, FocusSearch, OpenSettings, PickFolder, Quit, Rescan, ToggleInspector,
-    ToggleSidebar, Workspace,
+    ToggleSidebar, ToggleTreemap, Workspace,
 };
 
 icon_assets!(
@@ -32,12 +32,16 @@ icon_assets!(
         FolderSearch,
         FolderTree,
         HardDrive,
+        LayoutGrid,
         Link,
         ListTree,
         Lock,
         LockOpen,
         Monitor,
         ShieldAlert,
+        ShieldCheck,
+        Zap,
+        ZoomIn,
     ]
 );
 
@@ -47,6 +51,11 @@ impl AssetSource for TexTreeAssets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
         if path == "icons/textree.png" {
             return Ok(Some(Cow::Borrowed(include_bytes!("../assets/textree.png"))));
+        }
+        if path == "icons/textree-64.png" {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/textree-64.png"
+            ))));
         }
         if let Some(asset) = ExtraIcons.load(path)? {
             return Ok(Some(asset));
@@ -77,6 +86,7 @@ fn main() {
                 KeyBinding::new("escape", CancelOrDismiss, Some("TexTreeWorkspace")),
                 KeyBinding::new("ctrl-b", ToggleSidebar, Some("TexTreeWorkspace")),
                 KeyBinding::new("ctrl-i", ToggleInspector, Some("TexTreeWorkspace")),
+                KeyBinding::new("ctrl-t", ToggleTreemap, Some("TexTreeWorkspace")),
                 KeyBinding::new("ctrl-,", OpenSettings, Some("TexTreeWorkspace")),
                 KeyBinding::new("ctrl-q", Quit, Some("TexTreeWorkspace")),
             ]);

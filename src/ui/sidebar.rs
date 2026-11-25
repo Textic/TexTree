@@ -11,12 +11,12 @@ use gpui_kit::{
     div, prelude::*, px, relative,
 };
 
-use crate::models::DriveKind;
+use crate::models::{DriveKind, ScanEngineKind};
 use crate::scanner::ScanTarget;
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
-    STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, format_count, format_duration_ms,
-    format_size, soft_tint, solid, usage_bar_color,
+    STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, format_count,
+    format_duration_ms, format_size, soft_tint, solid, usage_bar_color,
 };
 use crate::ui::workspace::{ScanState, Workspace};
 
@@ -350,7 +350,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
 
 fn render_scan_summary_footer(ws: &Workspace) -> impl IntoElement {
     let unit = ws.settings.size_unit;
-    let (title, files, dirs, bytes, denied, elapsed_ms) = match &ws.scan_state {
+    let (title, files, dirs, bytes, denied, elapsed_ms, engine_opt) = match &ws.scan_state {
         ScanState::Scanning(p) => (
             "Scanning...".to_string(),
             p.scanned_files,
@@ -358,6 +358,7 @@ fn render_scan_summary_footer(ws: &Workspace) -> impl IntoElement {
             p.scanned_bytes,
             p.denied_count,
             p.elapsed_ms,
+            None,
         ),
         _ => {
             if let Some(tree) = &ws.tree {
@@ -369,9 +370,10 @@ fn render_scan_summary_footer(ws: &Workspace) -> impl IntoElement {
                     r.logical_size,
                     r.denied_count,
                     tree.scan_duration_ms,
+                    Some(tree.engine),
                 )
             } else {
-                ("Idle".to_string(), 0, 0, 0, 0, 0)
+                ("Idle".to_string(), 0, 0, 0, 0, 0, None)
             }
         }
     };
@@ -403,6 +405,32 @@ fn render_scan_summary_footer(ws: &Workspace) -> impl IntoElement {
                         .child(SharedString::from(format_duration_ms(elapsed_ms))),
                 ),
         )
+        .when_some(engine_opt, |col, eng| {
+            let is_mft = matches!(eng, ScanEngineKind::NtfsMft | ScanEngineKind::Hybrid);
+            col.child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .text_xs()
+                    .child(div().text_color(solid(TEXT_MUTED)).child("Engine"))
+                    .child(
+                        div()
+                            .px_1p5()
+                            .rounded(px(3.))
+                            .bg(if is_mft {
+                                soft_tint(STATUS_SUCCESS, 0.14)
+                            } else {
+                                solid(BG_ELEVATED)
+                            })
+                            .text_color(if is_mft {
+                                solid(STATUS_SUCCESS)
+                            } else {
+                                solid(TEXT_SECONDARY)
+                            })
+                            .child(eng.label()),
+                    ),
+            )
+        })
         .child(
             h_flex()
                 .justify_between()

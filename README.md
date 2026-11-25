@@ -4,8 +4,10 @@ Fast, minimalist, flat-dark disk space analyzer built in Rust with **GPUI-Kit**.
 
 ## Features
 
-- **Entire PC & Per-Drive Scanning**: Inspect any individual drive, custom folder, or scan all fixed drives at once under a unified **This PC** tree.
-- **Virtualized Tree-Table**: Smooth 60–120 FPS browsing across hundreds of thousands of files and folders, showing `% of Parent`, `Total Size`, `Allocated` (size on disk), item counts, modification timestamps, and status badges.
+- **Entire PC & Per-Drive Scanning**: Inspect any individual drive, custom folder, or scan all fixed drives automatically on launch under a unified **This PC** tree (drives sorted A → Z).
+- **Fast NTFS MFT Direct Scanner**: When running as Administrator on Windows NTFS volumes, reads `$MFT` extents directly via `FSCTL_GET_NTFS_VOLUME_DATA` in 4 MiB sequential chunks, with automatic transparent fallback to the multi-threaded Win32/POSIX parallel walker (`FindFirstFileExW` + `rayon`) and one-click **Admin Mode (Fast MFT)** relaunch.
+- **Interactive Visual Treemap**: GPU-rendered Squarified Treemap (`Ctrl+T`) color-coded by file category with breadcrumb navigation, live hover path/size readout, single-click sync to Tree View & Inspector, double-click zoom-in, and right-click zoom-out.
+- **Virtualized Tree-Table**: Smooth 60–120 FPS browsing across millions of files and folders, showing `% of Parent`, `Total Size`, `Allocated` (size on disk), item counts, modification timestamps, and status badges.
 - **Locked & Inaccessible Inspection**:
   - Counts and highlights `Access Denied` paths during scans without aborting.
   - Uses the Windows **Restart Manager** API in the Inspector to detect which active process (and PID) holds a lock on a selected file.

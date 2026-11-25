@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -6,14 +8,15 @@ use futures_channel::mpsc::unbounded;
 use futures_util::StreamExt as _;
 use gpui_kit::{
     ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, PathPromptOptions,
-    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowControlArea,
+    Pixels, Point, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
+    WindowControlArea,
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
         button::{Button, ButtonVariants as _},
         h_flex,
         input::{Input, InputEvent, InputState},
-        resizable::{h_resizable, resizable_panel},
+        resizable::{h_resizable, resizable_panel, v_resizable},
         v_flex,
     },
     div, prelude::*, px,
@@ -27,9 +30,9 @@ use crate::platform::{self, FileLockStatus};
 use crate::scanner::{self, ScanEvent, ScanProgress, ScanTarget};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
-    STATUS_ERROR, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, apply_obsidian_theme,
-    crisp_resize_handle_appearance, format_count, format_duration_ms, format_size, full_hit_input,
-    render_app_badge, soft_tint, solid,
+    STATUS_ERROR, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    apply_obsidian_theme, crisp_resize_handle_appearance, format_count, format_duration_ms,
+    format_size, full_hit_input, render_app_badge, soft_tint, solid,
 };
 use crate::ui::extensions_view::render_extensions_view;
 use crate::ui::files_view::render_files_view;
@@ -39,6 +42,7 @@ use crate::ui::settings_modal::{
 };
 use crate::ui::sidebar::render_sidebar;
 use crate::ui::tree_table::render_tree_table;
+use crate::ui::treemap_view::{TreemapCanvasCache, render_treemap_pane};
 use crate::updater::{self, REPO_URL, UpdateInfo, UpdateState, spawn_tokio};
 
 gpui_kit::actions!(
@@ -50,6 +54,7 @@ gpui_kit::actions!(
         CancelOrDismiss,
         ToggleSidebar,
         ToggleInspector,
+        ToggleTreemap,
         OpenSettings,
         Quit
     ]
@@ -75,16 +80,24 @@ pub enum ScanState {
 pub struct Workspace {
     focus_handle: FocusHandle,
     pub settings: AppSettings,
+    pub is_elevated: bool,
     pub volumes: Vec<VolumeInfo>,
     pub selected_target: ScanTarget,
     pub scan_state: ScanState,
     cancel_token: Option<Arc<AtomicBool>>,
     scan_seq: u64,
-    pub tree: Option<DiskTree>,
+    pub tree: Option<Arc<DiskTree>>,
+    pub tree_version: u64,
     pub active_tab: MainTab,
     pub sort: SortSpec,
     pub expanded: HashSet<NodeId>,
     pub selected_node: Option<NodeId>,
+    pub selected_top_children: Vec<NodeId>,
+    pub selected_full_path: Option<SharedString>,
+    pub selected_has_fs_path: bool,
+    pub treemap_root: Option<NodeId>,
+    pub treemap_hovered: Option<NodeId>,
+    pub treemap_cache: Rc<RefCell<TreemapCanvasCache>>,
     pub visible_rows: Vec<VisibleRow>,
     pub top_file_rows: Vec<NodeId>,
     pub extension_rows: Vec<ExtensionStat>,
@@ -125,20 +138,29 @@ impl Workspace {
             }
         });
 
+        let auto_scan = settings.auto_scan_on_launch;
         let auto_check = settings.auto_check_updates;
         let mut ws = Self {
             focus_handle,
             settings,
+            is_elevated: platform::is_elevated(),
             volumes,
             selected_target,
             scan_state: ScanState::Idle,
             cancel_token: None,
             scan_seq: 0,
             tree: None,
+            tree_version: 0,
             active_tab: MainTab::Tree,
             sort: SortSpec::default(),
             expanded: HashSet::new(),
             selected_node: None,
+            selected_top_children: Vec::new(),
+            selected_full_path: None,
+            selected_has_fs_path: false,
+            treemap_root: None,
+            treemap_hovered: None,
+            treemap_cache: Rc::new(RefCell::new(TreemapCanvasCache::default())),
             visible_rows: Vec::new(),
             top_file_rows: Vec::new(),
             extension_rows: Vec::new(),
@@ -162,6 +184,9 @@ impl Workspace {
             _subscriptions: vec![search_sub],
         };
 
+        if auto_scan {
+            ws.start_scan(ScanTarget::AllFixedDrives, cx);
+        }
         if auto_check {
             ws.run_update_check(false, cx);
         }
@@ -189,8 +214,9 @@ impl Workspace {
         let (tx, mut rx) = unbounded::<ScanEvent>();
         let volumes = self.volumes.clone();
         let sort = self.sort;
+        let prefer_mft = self.settings.prefer_ntfs_mft;
 
-        scanner::spawn_scan(target, volumes, sort, cancel, tx);
+        scanner::spawn_scan(target, volumes, sort, prefer_mft, cancel, tx);
 
         cx.spawn(async move |this, cx| {
             while let Some(evt) = rx.next().await {
@@ -211,18 +237,16 @@ impl Workspace {
                             let root_id = tree.root;
                             let mut expanded = HashSet::new();
                             expanded.insert(root_id);
-                            // Also expand first-level drives automatically when scanning Entire PC
-                            if tree.root_node().flags.contains(crate::models::NodeFlags::IS_VIRTUAL) {
-                                for &child in &tree.root_node().children {
-                                    expanded.insert(child);
-                                }
-                            }
-                            this.tree = Some(tree);
+                            this.tree = Some(Arc::new(tree));
+                            this.tree_version = this.tree_version.wrapping_add(1);
                             this.expanded = expanded;
                             this.selected_node = Some(root_id);
+                            this.treemap_root = Some(root_id);
+                            this.treemap_hovered = None;
                             this.lock_status = FileLockStatus::NotApplicable;
                             this.ext_filter = None;
                             this.denied_only_filter = false;
+                            this.refresh_selection_cache();
                             this.rebuild_cached_views();
                             this.volumes = platform::list_volumes();
                             cx.notify();
@@ -315,7 +339,7 @@ impl Workspace {
             self.sort.descending = !matches!(col, SortColumn::Name);
         }
         if let Some(tree) = &mut self.tree {
-            tree.sort_children(self.sort);
+            Arc::make_mut(tree).sort_children(self.sort);
         }
         self.rebuild_cached_views();
         cx.notify();
@@ -333,9 +357,32 @@ impl Workspace {
         let changed = self.selected_node != Some(node_id);
         self.selected_node = Some(node_id);
         if changed {
+            self.refresh_selection_cache();
             self.inspect_lock_for_selected(cx);
         }
         cx.notify();
+    }
+
+    fn refresh_selection_cache(&mut self) {
+        self.selected_top_children.clear();
+        self.selected_full_path = None;
+        self.selected_has_fs_path = false;
+
+        let (Some(tree), Some(node_id)) = (&self.tree, self.selected_node) else {
+            return;
+        };
+        let Some(node) = tree.get(node_id) else {
+            return;
+        };
+        if let Some(path) = tree.full_path(node_id) {
+            self.selected_has_fs_path = true;
+            self.selected_full_path = Some(SharedString::from(path.to_string_lossy().into_owned()));
+        } else {
+            self.selected_full_path = Some(node.name.clone());
+        }
+        if node.is_container() {
+            self.selected_top_children = tree.largest_children(node_id, 5);
+        }
     }
 
     pub fn recheck_selected_lock(&mut self, cx: &mut Context<Self>) {
@@ -562,10 +609,13 @@ impl Workspace {
                             .and_then(|t| t.get(node_id))
                             .and_then(|n| n.parent);
                         if let Some(tree) = &mut this.tree {
-                            tree.remove_subtree_soft(node_id);
+                            Arc::make_mut(tree).remove_subtree_soft(node_id);
+                            this.tree_version = this.tree_version.wrapping_add(1);
                         }
                         this.selected_node = parent_id;
+                        this.treemap_hovered = None;
                         this.lock_status = FileLockStatus::NotApplicable;
+                        this.refresh_selection_cache();
                         this.rebuild_cached_views();
                         this.volumes = platform::list_volumes();
                         this.toast_message =
@@ -609,6 +659,103 @@ impl Workspace {
         self.settings.confirm_before_trash = !self.settings.confirm_before_trash;
         self.settings.save();
         cx.notify();
+    }
+
+    pub fn toggle_auto_scan_on_launch(&mut self, cx: &mut Context<Self>) {
+        self.settings.auto_scan_on_launch = !self.settings.auto_scan_on_launch;
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_treemap(&mut self, cx: &mut Context<Self>) {
+        self.settings.show_treemap = !self.settings.show_treemap;
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_prefer_ntfs_mft(&mut self, cx: &mut Context<Self>) {
+        self.settings.prefer_ntfs_mft = !self.settings.prefer_ntfs_mft;
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub fn relaunch_as_admin(&mut self, cx: &mut Context<Self>) {
+        match platform::relaunch_as_admin() {
+            Ok(()) => {
+                self.settings.save();
+                cx.quit();
+            }
+            Err(err) => {
+                self.toast_message = Some((err, true));
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn set_treemap_root(&mut self, node_id: NodeId, cx: &mut Context<Self>) {
+        self.treemap_root = Some(node_id);
+        self.treemap_hovered = None;
+        if !self.settings.show_treemap {
+            self.settings.show_treemap = true;
+            self.settings.save();
+        }
+        cx.notify();
+    }
+
+    pub fn treemap_zoom_up(&mut self, cx: &mut Context<Self>) {
+        let Some(tree) = &self.tree else {
+            return;
+        };
+        let current = self.treemap_root.unwrap_or(tree.root);
+        if current == tree.root {
+            return;
+        }
+        if let Some(pid) = tree.get(current).and_then(|n| n.parent) {
+            self.treemap_root = Some(pid);
+            self.treemap_hovered = None;
+            cx.notify();
+        }
+    }
+
+    pub fn handle_treemap_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let hit = {
+            let cache = self.treemap_cache.borrow();
+            let lx = f32::from(position.x) - f32::from(cache.origin.x);
+            let ly = f32::from(position.y) - f32::from(cache.origin.y);
+            cache.layout.hit_test(lx, ly).map(|r| r.node_id)
+        };
+        if self.treemap_hovered != hit {
+            self.treemap_hovered = hit;
+            cx.notify();
+        }
+    }
+
+    pub fn handle_treemap_click(
+        &mut self,
+        position: Point<Pixels>,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let hit = {
+            let cache = self.treemap_cache.borrow();
+            let lx = f32::from(position.x) - f32::from(cache.origin.x);
+            let ly = f32::from(position.y) - f32::from(cache.origin.y);
+            cache.layout.hit_test(lx, ly)
+        };
+        let Some(rect) = hit else {
+            return;
+        };
+        self.reveal_node_in_tree(rect.node_id, cx);
+        if click_count >= 2
+            && let Some(tree) = &self.tree
+            && let Some(node) = tree.get(rect.node_id)
+        {
+            if node.is_container() {
+                self.set_treemap_root(rect.node_id, cx);
+            } else if let Some(pid) = node.parent {
+                self.set_treemap_root(pid, cx);
+            }
+        }
     }
 
     pub fn toggle_auto_check_updates(&mut self, cx: &mut Context<Self>) {
@@ -1097,6 +1244,59 @@ impl Workspace {
                                 .child(label),
                         )
                     })
+                    .when(cfg!(target_os = "windows"), |row| {
+                        if self.is_elevated {
+                            row.child(
+                                h_flex()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(soft_tint(STATUS_SUCCESS, 0.14))
+                                    .border_1()
+                                    .border_color(soft_tint(STATUS_SUCCESS, 0.30))
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(STATUS_SUCCESS))
+                                    .child(Icon::new(LucideIcon::ShieldCheck).xsmall())
+                                    .child("MFT"),
+                            )
+                        } else {
+                            row.child(
+                                h_flex()
+                                    .id("hdr-relaunch-admin")
+                                    .px_2()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(soft_tint(accent.primary_hex(), 0.12))
+                                    .border_1()
+                                    .border_color(soft_tint(accent.primary_hex(), 0.35))
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(accent.primary_hex()))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(soft_tint(accent.primary_hex(), 0.22)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.relaunch_as_admin(cx);
+                                    }))
+                                    .child(Icon::new(LucideIcon::Zap).xsmall())
+                                    .child("Admin Mode (MFT)"),
+                            )
+                        }
+                    })
+                    .child(
+                        Button::new("hdr-toggle-treemap")
+                            .with_size(Size::XSmall)
+                            .ghost()
+                            .icon(IconName::PanelBottom)
+                            .tooltip("Toggle Treemap (Ctrl+T)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_treemap(cx);
+                            })),
+                    )
                     .child(
                         Button::new("hdr-toggle-inspector")
                             .with_size(Size::XSmall)
@@ -1310,14 +1510,29 @@ impl Workspace {
                     )
                 },
             )
-            // Active view or calm empty state
+            // Active view (with optional split Treemap below) or calm empty state
             .child(div().flex_1().min_h_0().w_full().child(if self.tree.is_none() {
                 self.render_empty_state(cx).into_any_element()
             } else {
-                match self.active_tab {
+                let primary_view = match self.active_tab {
                     MainTab::Tree => render_tree_table(self, cx).into_any_element(),
                     MainTab::TopFiles => render_files_view(self, cx).into_any_element(),
                     MainTab::Extensions => render_extensions_view(self, cx).into_any_element(),
+                };
+                if self.settings.show_treemap {
+                    v_resizable("center-treemap-split")
+                        .with_handle_appearance(crisp_resize_handle_appearance(accent))
+                        .child(resizable_panel().child(primary_view))
+                        .child(
+                            resizable_panel()
+                                .size(px(260.))
+                                .size_range(px(140.)..px(560.))
+                                .fixed()
+                                .child(render_treemap_pane(self, cx)),
+                        )
+                        .into_any_element()
+                } else {
+                    primary_view
                 }
             }))
     }
@@ -1564,6 +1779,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
                 this.show_inspector = !this.show_inspector;
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTreemap, _, cx| {
+                this.toggle_treemap(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 this.show_settings = !this.show_settings;

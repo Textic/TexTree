@@ -277,19 +277,43 @@ fn render_tree_rows(
 
             let has_children = row.has_children;
             let is_expanded = row.is_expanded;
+            let volume_subtitle: Option<SharedString> = if node.flags.contains(NodeFlags::IS_VOLUME) {
+                ws.volumes
+                    .iter()
+                    .find(|v| v.root_path.to_string_lossy().eq_ignore_ascii_case(node.name.as_ref()))
+                    .map(|v| {
+                        let lbl = if v.label.is_empty() {
+                            v.kind.label().to_string()
+                        } else {
+                            v.label.clone()
+                        };
+                        SharedString::from(lbl)
+                    })
+            } else {
+                None
+            };
 
             Some(
                 h_flex()
                     .id(("tree-row", ix))
                     .w_full()
                     .h(px(ROW_HEIGHT))
+                    .relative()
                     .px_2()
                     .items_center()
                     .bg(row_bg)
                     .border_b_1()
                     .border_color(solid(BORDER_SUBTLE))
                     .when(is_selected, |r| {
-                        r.border_l_2().border_color(solid(accent.primary_hex()))
+                        r.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(2.))
+                                .bg(solid(accent.primary_hex())),
+                        )
                     })
                     .hover(|s| s.bg(solid(BG_HOVER)))
                     .cursor_pointer()
@@ -339,20 +363,38 @@ fn render_tree_rows(
                             })
                             .child(icon_el.xsmall().text_color(solid(icon_color)))
                             .child(
-                                div()
+                                h_flex()
                                     .min_w_0()
                                     .flex_1()
-                                    .truncate()
-                                    .text_xs()
-                                    .when(node.is_container(), |d| d.font_medium())
-                                    .text_color(if is_denied {
-                                        solid(STATUS_ERROR)
-                                    } else if is_hidden {
-                                        solid(TEXT_SECONDARY)
-                                    } else {
-                                        solid(TEXT_PRIMARY)
-                                    })
-                                    .child(SharedString::from(node.name.to_string())),
+                                    .items_center()
+                                    .gap_1p5()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .when(volume_subtitle.is_none(), |d| d.min_w_0().flex_1())
+                                            .truncate()
+                                            .text_xs()
+                                            .when(node.is_container(), |d| d.font_medium())
+                                            .text_color(if is_denied {
+                                                solid(STATUS_ERROR)
+                                            } else if is_hidden {
+                                                solid(TEXT_SECONDARY)
+                                            } else {
+                                                solid(TEXT_PRIMARY)
+                                            })
+                                            .child(node.name.clone()),
+                                    )
+                                    .when_some(volume_subtitle, |row, lbl| {
+                                        row.child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(solid(TEXT_MUTED))
+                                                .child(lbl),
+                                        )
+                                    }),
                             ),
                     )
                     // % of Parent bar + percentage
@@ -366,11 +408,9 @@ fn render_tree_rows(
                             .child(
                                 div()
                                     .flex_1()
-                                    .h(px(6.))
+                                    .h(px(5.))
                                     .rounded(px(2.))
-                                    .bg(solid(BG_BASE))
-                                    .border_1()
-                                    .border_color(solid(BORDER_SUBTLE))
+                                    .bg(solid(BG_ELEVATED))
                                     .overflow_hidden()
                                     .child(
                                         div()

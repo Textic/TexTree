@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use bitflags::bitflags;
+use gpui_kit::SharedString;
 
 pub type NodeId = u32;
 
@@ -23,7 +24,7 @@ bitflags! {
 
 #[derive(Debug, Clone)]
 pub struct FileNode {
-    pub name: Box<str>,
+    pub name: SharedString,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
     pub logical_size: u64,
@@ -94,6 +95,24 @@ pub struct ExtensionStat {
     pub file_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanEngineKind {
+    #[default]
+    ParallelWalk,
+    NtfsMft,
+    Hybrid,
+}
+
+impl ScanEngineKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ParallelWalk => "Parallel Walk",
+            Self::NtfsMft => "NTFS MFT",
+            Self::Hybrid => "MFT + Parallel",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiskTree {
     pub root: NodeId,
@@ -105,11 +124,12 @@ pub struct DiskTree {
     pub extensions: Vec<Box<str>>,
     pub scan_duration_ms: u64,
     pub target_label: String,
+    pub engine: ScanEngineKind,
 }
 
 impl DiskTree {
     pub fn new(
-        root_name: impl Into<Box<str>>,
+        root_name: impl Into<SharedString>,
         root_flags: NodeFlags,
         root_base_path: Option<PathBuf>,
         target_label: impl Into<String>,
@@ -135,6 +155,7 @@ impl DiskTree {
             extensions: vec![Box::from("")],
             scan_duration_ms: 0,
             target_label: target_label.into(),
+            engine: ScanEngineKind::ParallelWalk,
         }
     }
 
@@ -299,8 +320,19 @@ impl DiskTree {
             if self.nodes[idx].children.len() <= 1 {
                 continue;
             }
+            let is_virtual = self.nodes[idx].flags.contains(NodeFlags::IS_VIRTUAL);
             let mut children = std::mem::take(&mut self.nodes[idx].children);
-            children.sort_unstable_by(|&a, &b| compare_nodes(&self.nodes, a, b, sort));
+            if is_virtual {
+                // Keep top-level drives under "This PC" ordered A -> Z to match the sidebar.
+                children.sort_unstable_by(|&a, &b| {
+                    self.nodes[a as usize]
+                        .name
+                        .to_ascii_lowercase()
+                        .cmp(&self.nodes[b as usize].name.to_ascii_lowercase())
+                });
+            } else {
+                children.sort_unstable_by(|&a, &b| compare_nodes(&self.nodes, a, b, sort));
+            }
             self.nodes[idx].children = children;
         }
     }
@@ -733,7 +765,7 @@ mod tests {
 
         let dir_a = tree.nodes.len() as NodeId;
         tree.nodes.push(FileNode {
-            name: Box::from("Projects"),
+            name: SharedString::from("Projects"),
             parent: Some(0),
             children: Vec::new(),
             logical_size: 0,
@@ -751,7 +783,7 @@ mod tests {
         let file_big = tree.nodes.len() as NodeId;
         let ext_pak = interner.intern_from_filename("assets.pak");
         tree.nodes.push(FileNode {
-            name: Box::from("assets.pak"),
+            name: SharedString::from("assets.pak"),
             parent: Some(dir_a),
             children: Vec::new(),
             logical_size: 5000,
@@ -769,7 +801,7 @@ mod tests {
         let file_small = tree.nodes.len() as NodeId;
         let ext_rs = interner.intern_from_filename("main.rs");
         tree.nodes.push(FileNode {
-            name: Box::from("main.rs"),
+            name: SharedString::from("main.rs"),
             parent: Some(dir_a),
             children: Vec::new(),
             logical_size: 500,
@@ -786,7 +818,7 @@ mod tests {
 
         let denied_dir = tree.nodes.len() as NodeId;
         tree.nodes.push(FileNode {
-            name: Box::from("System Volume Information"),
+            name: SharedString::from("System Volume Information"),
             parent: Some(0),
             children: Vec::new(),
             logical_size: 0,
@@ -855,5 +887,61 @@ mod tests {
         let filtered = tree.flatten_visible(&HashSet::new(), "main.rs", true);
         let ids: Vec<NodeId> = filtered.iter().map(|r| r.node_id).collect();
         assert_eq!(ids, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn keeps_virtual_root_drives_sorted_a_to_z() {
+        let mut tree = DiskTree::new(
+            "This PC",
+            NodeFlags::IS_DIR | NodeFlags::IS_VIRTUAL,
+            None,
+            "This PC",
+        );
+        for (drive, size) in [("X:\\", 100), ("E:\\", 900), ("C:\\", 300), ("D:\\", 500)] {
+            let vol_id = tree.nodes.len() as NodeId;
+            tree.nodes.push(FileNode {
+                name: SharedString::from(drive),
+                parent: Some(0),
+                children: Vec::new(),
+                logical_size: 0,
+                allocated_size: 0,
+                file_count: 0,
+                dir_count: 0,
+                denied_count: 0,
+                modified_secs: 0,
+                flags: NodeFlags::IS_DIR | NodeFlags::IS_VOLUME,
+                ext_id: 0,
+                removed: false,
+            });
+            let file_id = tree.nodes.len() as NodeId;
+            tree.nodes.push(FileNode {
+                name: SharedString::from("data.bin"),
+                parent: Some(vol_id),
+                children: Vec::new(),
+                logical_size: size,
+                allocated_size: size,
+                file_count: 0,
+                dir_count: 0,
+                denied_count: 0,
+                modified_secs: 0,
+                flags: NodeFlags::empty(),
+                ext_id: 0,
+                removed: false,
+            });
+            tree.nodes[vol_id as usize].children.push(file_id);
+            tree.nodes[0].children.push(vol_id);
+        }
+
+        tree.aggregate_and_sort(SortSpec {
+            column: SortColumn::Size,
+            descending: true,
+        });
+
+        let drive_names: Vec<&str> = tree.nodes[0]
+            .children
+            .iter()
+            .map(|&id| tree.nodes[id as usize].name.as_ref())
+            .collect();
+        assert_eq!(drive_names, vec!["C:\\", "D:\\", "E:\\", "X:\\"]);
     }
 }
