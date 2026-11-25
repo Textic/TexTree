@@ -96,6 +96,10 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub auto_scan_on_launch: bool,
     #[serde(default = "default_true")]
+    pub prefer_ntfs_mft: bool,
+    #[serde(default = "default_true")]
+    pub show_treemap: bool,
+    #[serde(default = "default_true")]
     pub auto_check_updates: bool,
 }
 
@@ -111,6 +115,8 @@ impl Default for AppSettings {
             show_hidden_files: true,
             confirm_before_trash: true,
             auto_scan_on_launch: true,
+            prefer_ntfs_mft: true,
+            show_treemap: true,
             auto_check_updates: true,
         }
     }
@@ -155,6 +161,8 @@ mod tests {
         assert!(defaults.show_hidden_files);
         assert!(defaults.confirm_before_trash);
         assert!(defaults.auto_scan_on_launch);
+        assert!(defaults.prefer_ntfs_mft);
+        assert!(defaults.show_treemap);
         assert!(defaults.auto_check_updates);
 
         let custom = AppSettings {
@@ -163,6 +171,8 @@ mod tests {
             show_hidden_files: false,
             confirm_before_trash: true,
             auto_scan_on_launch: false,
+            prefer_ntfs_mft: false,
+            show_treemap: false,
             auto_check_updates: false,
         };
         let json = serde_json::to_string(&custom).unwrap();
@@ -171,6 +181,8 @@ mod tests {
         assert_eq!(parsed.size_unit, SizeUnit::Decimal);
         assert!(!parsed.show_hidden_files);
         assert!(!parsed.auto_scan_on_launch);
+        assert!(!parsed.prefer_ntfs_mft);
+        assert!(!parsed.show_treemap);
         assert!(!parsed.auto_check_updates);
     }
 }

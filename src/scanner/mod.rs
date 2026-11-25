@@ -1,3 +1,4 @@
+pub mod ntfs_mft;
 pub mod parallel_walk;
 
 use std::path::PathBuf;
@@ -43,18 +44,20 @@ pub enum ScanEvent {
     Error(String),
 }
 
-/// Launches a background parallel scan and streams progress + final `DiskTree` over `tx`.
+/// Launches a background scan (using direct NTFS MFT when elevated & enabled, falling back
+/// transparently to parallel Win32/POSIX walking) and streams progress + final `DiskTree`.
 pub fn spawn_scan(
     target: ScanTarget,
     volumes: Vec<VolumeInfo>,
     sort: SortSpec,
+    prefer_ntfs_mft: bool,
     cancel: Arc<AtomicBool>,
     tx: UnboundedSender<ScanEvent>,
 ) {
     std::thread::Builder::new()
         .name("textree-scan".to_string())
         .spawn(move || {
-            parallel_walk::run_scan(target, volumes, sort, cancel, tx);
+            parallel_walk::run_scan(target, volumes, sort, prefer_ntfs_mft, cancel, tx);
         })
         .expect("failed to spawn scanner thread");
 }

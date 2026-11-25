@@ -17,7 +17,7 @@ use gpui_kit::{
 use crate::models::AppSettings;
 use crate::ui::workspace::{
     CancelOrDismiss, FocusSearch, OpenSettings, PickFolder, Quit, Rescan, ToggleInspector,
-    ToggleSidebar, Workspace,
+    ToggleSidebar, ToggleTreemap, Workspace,
 };
 
 icon_assets!(
@@ -32,12 +32,16 @@ icon_assets!(
         FolderSearch,
         FolderTree,
         HardDrive,
+        LayoutGrid,
         Link,
         ListTree,
         Lock,
         LockOpen,
         Monitor,
         ShieldAlert,
+        ShieldCheck,
+        Zap,
+        ZoomIn,
     ]
 );
 
@@ -82,6 +86,7 @@ fn main() {
                 KeyBinding::new("escape", CancelOrDismiss, Some("TexTreeWorkspace")),
                 KeyBinding::new("ctrl-b", ToggleSidebar, Some("TexTreeWorkspace")),
                 KeyBinding::new("ctrl-i", ToggleInspector, Some("TexTreeWorkspace")),
+                KeyBinding::new("ctrl-t", ToggleTreemap, Some("TexTreeWorkspace")),
                 KeyBinding::new("ctrl-,", OpenSettings, Some("TexTreeWorkspace")),
                 KeyBinding::new("ctrl-q", Quit, Some("TexTreeWorkspace")),
             ]);

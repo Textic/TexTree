@@ -8,17 +8,19 @@ use gpui_kit::SharedString;
 use rayon::prelude::*;
 
 use crate::models::tree::ExtInterner;
-use crate::models::{DiskTree, DriveKind, FileNode, NodeFlags, NodeId, SortSpec, VolumeInfo};
-use crate::platform::cluster_size_for_path;
-use crate::scanner::{ScanEvent, ScanProgress, ScanTarget};
+use crate::models::{
+    DiskTree, DriveKind, FileNode, NodeFlags, NodeId, ScanEngineKind, SortSpec, VolumeInfo,
+};
+use crate::platform::{self, cluster_size_for_path};
+use crate::scanner::{ScanEvent, ScanProgress, ScanTarget, ntfs_mft};
 
 const MAX_SCAN_DEPTH: u16 = 256;
 
-struct ScanCounters {
-    files: AtomicU64,
-    dirs: AtomicU64,
-    bytes: AtomicU64,
-    denied: AtomicU32,
+pub(crate) struct ScanCounters {
+    pub(crate) files: AtomicU64,
+    pub(crate) dirs: AtomicU64,
+    pub(crate) bytes: AtomicU64,
+    pub(crate) denied: AtomicU32,
     last_path_update_ms: AtomicU64,
     current_path: Mutex<String>,
     started: Instant,
@@ -37,7 +39,7 @@ impl ScanCounters {
         }
     }
 
-    fn maybe_set_path(&self, path: &Path) {
+    pub(crate) fn maybe_set_path(&self, path: &Path) {
         let now_ms = self.started.elapsed().as_millis() as u64;
         let prev = self.last_path_update_ms.load(Ordering::Relaxed);
         if now_ms.saturating_sub(prev) >= 60
@@ -68,19 +70,20 @@ impl ScanCounters {
     }
 }
 
-struct TempNode {
-    name: Box<str>,
-    logical_size: u64,
-    allocated_size: u64,
-    modified_secs: i64,
-    flags: NodeFlags,
-    children: Vec<TempNode>,
+pub(crate) struct TempNode {
+    pub(crate) name: Box<str>,
+    pub(crate) logical_size: u64,
+    pub(crate) allocated_size: u64,
+    pub(crate) modified_secs: i64,
+    pub(crate) flags: NodeFlags,
+    pub(crate) children: Vec<TempNode>,
 }
 
 pub fn run_scan(
     target: ScanTarget,
     volumes: Vec<VolumeInfo>,
     sort: SortSpec,
+    prefer_ntfs_mft: bool,
     cancel: Arc<AtomicBool>,
     tx: UnboundedSender<ScanEvent>,
 ) {
@@ -99,7 +102,7 @@ pub fn run_scan(
         }
     });
 
-    let result = execute_scan(&target, &volumes, sort, &counters, &cancel);
+    let result = execute_scan(&target, &volumes, sort, prefer_ntfs_mft, &counters, &cancel);
     done.store(true, Ordering::Relaxed);
     let _ = ticker.join();
 
@@ -127,19 +130,53 @@ pub fn scan_directory_sync(path: &Path, sort: SortSpec) -> Result<DiskTree, Stri
         &ScanTarget::Folder(path.to_path_buf()),
         &[],
         sort,
+        false,
         &counters,
         &cancel,
     )
+}
+
+fn scan_single_volume(
+    vol: &VolumeInfo,
+    try_mft: bool,
+    counters: &ScanCounters,
+    cancel: &AtomicBool,
+) -> (TempNode, bool) {
+    let root_name = vol.root_path.to_string_lossy().into_owned();
+    if try_mft && vol.file_system.eq_ignore_ascii_case("NTFS") {
+        if let Ok(mut node) =
+            ntfs_mft::scan_volume_mft(&vol.short_name, &root_name, counters, cancel)
+        {
+            node.flags |= NodeFlags::IS_VOLUME;
+            return (node, true);
+        }
+    }
+
+    let cluster = vol.cluster_size.max(512);
+    let mut node = scan_dir_recursive(
+        &vol.root_path,
+        root_name.into_boxed_str(),
+        NodeFlags::IS_DIR | NodeFlags::IS_VOLUME,
+        cluster,
+        0,
+        counters,
+        cancel,
+    );
+    node.flags |= NodeFlags::IS_VOLUME;
+    (node, false)
 }
 
 fn execute_scan(
     target: &ScanTarget,
     volumes: &[VolumeInfo],
     sort: SortSpec,
+    prefer_ntfs_mft: bool,
     counters: &ScanCounters,
     cancel: &AtomicBool,
 ) -> Result<DiskTree, String> {
     let started = Instant::now();
+    let try_mft = prefer_ntfs_mft && platform::is_elevated();
+
     let mut tree = match target {
         ScanTarget::AllFixedDrives => {
             let fixed: Vec<VolumeInfo> = volumes
@@ -156,27 +193,23 @@ fn execute_scan(
                 return Err("No mounted drives found to scan.".to_string());
             }
 
-            let subtrees: Vec<TempNode> = scan_vols
+            let results: Vec<(TempNode, bool)> = scan_vols
                 .into_par_iter()
-                .map(|vol| {
-                    let cluster = vol.cluster_size.max(512);
-                    let mut node = scan_dir_recursive(
-                        &vol.root_path,
-                        vol.root_path.to_string_lossy().into_owned().into_boxed_str(),
-                        NodeFlags::IS_DIR | NodeFlags::IS_VOLUME,
-                        cluster,
-                        0,
-                        counters,
-                        cancel,
-                    );
-                    node.flags |= NodeFlags::IS_VOLUME;
-                    node
-                })
+                .map(|vol| scan_single_volume(&vol, try_mft, counters, cancel))
                 .collect();
 
             if cancel.load(Ordering::Relaxed) {
                 return Err("Scan cancelled".to_string());
             }
+
+            let mft_count = results.iter().filter(|(_, used_mft)| *used_mft).count();
+            let engine = if mft_count == results.len() {
+                ScanEngineKind::NtfsMft
+            } else if mft_count > 0 {
+                ScanEngineKind::Hybrid
+            } else {
+                ScanEngineKind::ParallelWalk
+            };
 
             let mut disk_tree = DiskTree::new(
                 "This PC",
@@ -184,33 +217,30 @@ fn execute_scan(
                 None,
                 target.display_label(),
             );
+            disk_tree.engine = engine;
             let mut interner = ExtInterner::default();
-            for sub in subtrees {
+            for (sub, _) in results {
                 append_temp_subtree(&mut disk_tree, &mut interner, 0, sub);
             }
             disk_tree.extensions = interner.into_vec();
             disk_tree
         }
         ScanTarget::Volume(vol) => {
-            let cluster = vol.cluster_size.max(512);
-            let root_name = vol.root_path.to_string_lossy().into_owned();
-            let sub = scan_dir_recursive(
-                &vol.root_path,
-                root_name.clone().into_boxed_str(),
-                NodeFlags::IS_DIR | NodeFlags::IS_VOLUME,
-                cluster,
-                0,
-                counters,
-                cancel,
-            );
+            let (sub, used_mft) = scan_single_volume(vol, try_mft, counters, cancel);
             if cancel.load(Ordering::Relaxed) {
                 return Err("Scan cancelled".to_string());
             }
-            build_tree_from_root(
+            let mut disk_tree = build_tree_from_root(
                 sub,
                 Some(vol.root_path.clone()),
                 target.display_label(),
-            )
+            );
+            disk_tree.engine = if used_mft {
+                ScanEngineKind::NtfsMft
+            } else {
+                ScanEngineKind::ParallelWalk
+            };
+            disk_tree
         }
         ScanTarget::Folder(path) => {
             if !path.exists() {

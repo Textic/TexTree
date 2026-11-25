@@ -140,33 +140,48 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                             ),
                     )
                     // Action buttons
-                    .when(has_fs_path, |col| {
+                    .when(has_fs_path || is_container, |col| {
                         col.child(
                             h_flex()
                                 .w_full()
                                 .flex_wrap()
                                 .gap_1p5()
-                                .child(
-                                    Button::new("insp-reveal")
-                                        .with_size(Size::XSmall)
-                                        .secondary()
-                                        .icon(LucideIcon::ExternalLink)
-                                        .label("Reveal")
-                                        .tooltip("Reveal in File Explorer")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.reveal_selected_in_explorer(cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("insp-copy-path")
-                                        .with_size(Size::XSmall)
-                                        .secondary()
-                                        .icon(IconName::Copy)
-                                        .label("Copy Path")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.copy_selected_path(cx);
-                                        })),
-                                )
+                                .when(has_fs_path, |row| {
+                                    row.child(
+                                        Button::new("insp-reveal")
+                                            .with_size(Size::XSmall)
+                                            .secondary()
+                                            .icon(LucideIcon::ExternalLink)
+                                            .label("Reveal")
+                                            .tooltip("Reveal in File Explorer")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.reveal_selected_in_explorer(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("insp-copy-path")
+                                            .with_size(Size::XSmall)
+                                            .secondary()
+                                            .icon(IconName::Copy)
+                                            .label("Copy Path")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.copy_selected_path(cx);
+                                            })),
+                                    )
+                                })
+                                .when(is_container, |row| {
+                                    row.child(
+                                        Button::new("insp-zoom-treemap")
+                                            .with_size(Size::XSmall)
+                                            .secondary()
+                                            .icon(LucideIcon::ZoomIn)
+                                            .label("Treemap")
+                                            .tooltip("Focus this container in Treemap")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.set_treemap_root(node_id, cx);
+                                            })),
+                                    )
+                                })
                                 .when(can_rescan, |row| {
                                     row.child(
                                         Button::new("insp-rescan-branch")

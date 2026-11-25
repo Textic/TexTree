@@ -551,7 +551,10 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
     let show_hidden = ws.settings.show_hidden_files;
     let confirm_trash = ws.settings.confirm_before_trash;
     let auto_scan = ws.settings.auto_scan_on_launch;
+    let show_treemap = ws.settings.show_treemap;
+    let prefer_mft = ws.settings.prefer_ntfs_mft;
     let auto_check = ws.settings.auto_check_updates;
+    let is_elevated = ws.is_elevated;
 
     v_flex()
         .w_full()
@@ -564,6 +567,22 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                         .label("Automatically scan Entire PC on launch")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_auto_scan_on_launch(cx);
+                        })),
+                )
+                .child(
+                    Checkbox::new("set-show-treemap")
+                        .checked(show_treemap)
+                        .label("Show interactive visual Treemap panel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_treemap(cx);
+                        })),
+                )
+                .child(
+                    Checkbox::new("set-prefer-mft")
+                        .checked(prefer_mft)
+                        .label("Use fast direct NTFS MFT scanning when running as Administrator")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_prefer_ntfs_mft(cx);
                         })),
                 )
                 .child(
@@ -591,6 +610,53 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                         })),
                 ),
         )
+        .when(cfg!(target_os = "windows"), |col| {
+            col.child(
+                section_card("NTFS MFT Privileges").child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(if is_elevated {
+                                            solid(STATUS_SUCCESS)
+                                        } else {
+                                            solid(TEXT_PRIMARY)
+                                        })
+                                        .child(if is_elevated {
+                                            "Running as Administrator — Fast NTFS MFT active"
+                                        } else {
+                                            "Running as Standard User — Parallel Win32 mode"
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(solid(TEXT_MUTED))
+                                        .child("Reading raw NTFS Master File Tables requires elevated Windows privileges."),
+                                ),
+                        )
+                        .when(!is_elevated, |row| {
+                            row.child(
+                                Button::new("set-relaunch-admin")
+                                    .with_size(Size::XSmall)
+                                    .primary()
+                                    .label("Relaunch as Admin")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.relaunch_as_admin(cx);
+                                    })),
+                            )
+                        }),
+                ),
+            )
+        })
 }
 
 fn render_updates_about_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {

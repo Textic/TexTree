@@ -1,9 +1,11 @@
+pub mod elevation;
 pub mod locks;
 pub mod volumes;
 
 use std::path::Path;
 use std::process::Command;
 
+pub use elevation::{is_elevated, relaunch_as_admin};
 pub use locks::{FileLockStatus, inspect_file_lock};
 pub use volumes::{cluster_size_for_path, list_volumes};
 

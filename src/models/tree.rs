@@ -95,6 +95,24 @@ pub struct ExtensionStat {
     pub file_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanEngineKind {
+    #[default]
+    ParallelWalk,
+    NtfsMft,
+    Hybrid,
+}
+
+impl ScanEngineKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ParallelWalk => "Parallel Walk",
+            Self::NtfsMft => "NTFS MFT",
+            Self::Hybrid => "MFT + Parallel",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiskTree {
     pub root: NodeId,
@@ -106,6 +124,7 @@ pub struct DiskTree {
     pub extensions: Vec<Box<str>>,
     pub scan_duration_ms: u64,
     pub target_label: String,
+    pub engine: ScanEngineKind,
 }
 
 impl DiskTree {
@@ -136,6 +155,7 @@ impl DiskTree {
             extensions: vec![Box::from("")],
             scan_duration_ms: 0,
             target_label: target_label.into(),
+            engine: ScanEngineKind::ParallelWalk,
         }
     }
 
