@@ -3,8 +3,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::{
-    BorderStyle, Bounds, Context, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels,
-    Point, SharedString, Size as GpuiSize, canvas,
+    BorderStyle, Bounds, ContentMask, Context, FontWeight, MouseButton, MouseDownEvent,
+    MouseMoveEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Size as GpuiSize,
+    TextAlign, TextRun, canvas,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
         button::{Button, ButtonVariants as _},
@@ -13,22 +14,32 @@ use gpui_kit::{
     div, fill, hsla, outline, point, prelude::*, px,
 };
 
-use crate::models::{DiskTree, NodeId, TreemapLayout};
+use crate::models::{DiskTree, NodeId, SizeUnit, TreemapLayout};
 use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, TEXT_MUTED,
-    TEXT_PRIMARY, TEXT_SECONDARY, format_size, solid,
+    BG_BASE, BG_ELEVATED, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, TEXT_MUTED, TEXT_PRIMARY,
+    TEXT_SECONDARY, format_size, solid,
 };
 use crate::ui::workspace::Workspace;
+
+pub struct ShapedFolderHeader {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub line: ShapedLine,
+}
 
 #[derive(Default)]
 pub struct TreemapCanvasCache {
     pub tree_version: u64,
     pub root_id: NodeId,
     pub show_hidden: bool,
+    pub size_unit: SizeUnit,
     pub origin: Point<Pixels>,
     pub width: f32,
     pub height: f32,
     pub layout: TreemapLayout,
+    pub shaped_headers: Vec<ShapedFolderHeader>,
 }
 
 const LEGEND_ITEMS: [(&str, u32); 7] = [
@@ -56,7 +67,6 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
     let can_go_up = treemap_root != tree.root
         && tree.get(treemap_root).and_then(|n| n.parent).is_some();
 
-    // Build breadcrumb chain from scan root down to `treemap_root`
     let mut crumbs: Vec<(NodeId, SharedString)> = Vec::new();
     let mut cursor = Some(treemap_root);
     while let Some(cid) = cursor {
@@ -72,7 +82,6 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
     }
     crumbs.reverse();
 
-    // Live hover summary readout
     let hover_info: Option<(SharedString, SharedString)> = ws.treemap_hovered.and_then(|hid| {
         let node = tree.get(hid)?;
         let path = tree
@@ -107,7 +116,6 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
         .size_full()
         .bg(solid(BG_BASE))
         .overflow_hidden()
-        // Header strip with breadcrumbs, hover readout / legend, and close toggle
         .child(
             h_flex()
                 .w_full()
@@ -119,7 +127,6 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 .bg(solid(BG_SURFACE))
                 .border_b_1()
                 .border_color(solid(BORDER_SUBTLE))
-                // Left: Breadcrumb navigation
                 .child(
                     h_flex()
                         .min_w_0()
@@ -164,11 +171,10 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                             d.font_semibold().text_color(solid(TEXT_PRIMARY))
                                         })
                                         .when(!is_last, |d| {
-                                            d.text_color(solid(TEXT_SECONDARY))
-                                                .hover(|s| {
-                                                    s.bg(solid(BG_ELEVATED))
-                                                        .text_color(solid(TEXT_PRIMARY))
-                                                })
+                                            d.text_color(solid(TEXT_SECONDARY)).hover(|s| {
+                                                s.bg(solid(BG_ELEVATED))
+                                                    .text_color(solid(TEXT_PRIMARY))
+                                            })
                                         })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.set_treemap_root(cid, cx);
@@ -177,7 +183,6 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                 )
                         })),
                 )
-                // Right: Live hovered file readout OR compact color legend + close button
                 .child(
                     h_flex()
                         .flex_shrink_0()
@@ -242,7 +247,6 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                         ),
                 ),
         )
-        // Interactive GPU-rendered canvas area
         .child(
             div()
                 .id("treemap-canvas-wrap")
@@ -268,7 +272,7 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 )
                 .child(
                     canvas(
-                        move |bounds: Bounds<Pixels>, _window, _cx| {
+                        move |bounds: Bounds<Pixels>, window, _cx| {
                             let w = f32::from(bounds.size.width).max(0.0);
                             let h = f32::from(bounds.size.height).max(0.0);
                             let mut cache = cache_for_canvas.borrow_mut();
@@ -276,6 +280,7 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                             let needs_recompute = cache.tree_version != tree_version
                                 || cache.root_id != treemap_root
                                 || cache.show_hidden != show_hidden
+                                || cache.size_unit != unit
                                 || (cache.width - w).abs() > 1.5
                                 || (cache.height - h).abs() > 1.5;
                             if needs_recompute {
@@ -286,21 +291,163 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                     h,
                                     show_hidden,
                                 );
+
+                                // Pre-shape inline depth-1 folder header text ONCE per layout change.
+                                let base_font = window.text_style().font();
+                                let mut bold_font = base_font.clone();
+                                bold_font.weight = FontWeight::SEMIBOLD;
+                                let font_size = px(10.5);
+                                let text_sys = window.text_system();
+
+                                cache.shaped_headers = cache
+                                    .layout
+                                    .headers
+                                    .iter()
+                                    .filter_map(|hdr| {
+                                        let node = tree_for_prepaint.get(hdr.node_id)?;
+                                        let name_str = node.name.replace('\n', " ");
+                                        let show_size = hdr.w >= 135.0;
+                                        let (full_text, runs) = if show_size {
+                                            let size_suffix = format!(
+                                                "  {}",
+                                                format_size(node.logical_size, unit)
+                                            );
+                                            let name_len = name_str.len();
+                                            let suffix_len = size_suffix.len();
+                                            let combined = format!("{name_str}{size_suffix}");
+                                            (
+                                                SharedString::from(combined),
+                                                vec![
+                                                    TextRun {
+                                                        len: name_len,
+                                                        font: bold_font.clone(),
+                                                        color: solid(TEXT_PRIMARY),
+                                                        background_color: None,
+                                                        underline: None,
+                                                        strikethrough: None,
+                                                    },
+                                                    TextRun {
+                                                        len: suffix_len,
+                                                        font: base_font.clone(),
+                                                        color: solid(TEXT_MUTED),
+                                                        background_color: None,
+                                                        underline: None,
+                                                        strikethrough: None,
+                                                    },
+                                                ],
+                                            )
+                                        } else {
+                                            let name_len = name_str.len();
+                                            (
+                                                SharedString::from(name_str),
+                                                vec![TextRun {
+                                                    len: name_len,
+                                                    font: bold_font.clone(),
+                                                    color: solid(TEXT_PRIMARY),
+                                                    background_color: None,
+                                                    underline: None,
+                                                    strikethrough: None,
+                                                }],
+                                            )
+                                        };
+                                        let line = text_sys.shape_line(
+                                            full_text,
+                                            font_size,
+                                            &runs,
+                                            None,
+                                        );
+                                        Some(ShapedFolderHeader {
+                                            x: hdr.x,
+                                            y: hdr.y,
+                                            w: hdr.w,
+                                            h: hdr.h,
+                                            line,
+                                        })
+                                    })
+                                    .collect();
+
                                 cache.tree_version = tree_version;
                                 cache.root_id = treemap_root;
                                 cache.show_hidden = show_hidden;
+                                cache.size_unit = unit;
                                 cache.width = w;
                                 cache.height = h;
                             }
                         },
-                        move |bounds: Bounds<Pixels>, (), window, _cx| {
+                        move |bounds: Bounds<Pixels>, (), window, cx| {
                             window.paint_quad(fill(bounds, solid(BG_BASE)));
 
                             let cache = cache_for_paint.borrow();
                             let ox = f32::from(bounds.origin.x);
                             let oy = f32::from(bounds.origin.y);
 
-                            // Paint every flat tile inset by 0.5px to create razor-sharp 1px dark seams.
+                            // 1. Paint depth-1 and depth-2 folder container plates with crisp structural borders.
+                            for frame in &cache.layout.frames {
+                                let rect = Bounds {
+                                    origin: point(px(ox + frame.x), px(oy + frame.y)),
+                                    size: GpuiSize {
+                                        width: px(frame.w),
+                                        height: px(frame.h),
+                                    },
+                                };
+                                let border_col = if frame.depth == 1 {
+                                    solid(0x3f3f46)
+                                } else {
+                                    solid(0x2c2c34)
+                                };
+                                window.paint_quad(PaintQuad {
+                                    bounds: rect,
+                                    corner_radii: (0.).into(),
+                                    background: solid(frame.color_hex).into(),
+                                    border_widths: px(1.).into(),
+                                    border_color: border_col,
+                                    border_style: BorderStyle::Solid,
+                                });
+                            }
+
+                            // 2. Paint inline depth-1 folder header bars and pre-shaped titles.
+                            for hdr in &cache.shaped_headers {
+                                let hdr_rect = Bounds {
+                                    origin: point(px(ox + hdr.x), px(oy + hdr.y)),
+                                    size: GpuiSize {
+                                        width: px(hdr.w),
+                                        height: px(hdr.h),
+                                    },
+                                };
+                                window.paint_quad(fill(hdr_rect, solid(BG_ELEVATED)));
+                                // Subtle 1px bottom divider under folder header
+                                let div_rect = Bounds {
+                                    origin: point(px(ox + hdr.x), px(oy + hdr.y + hdr.h - 1.0)),
+                                    size: GpuiSize {
+                                        width: px(hdr.w),
+                                        height: px(1.0),
+                                    },
+                                };
+                                window.paint_quad(fill(div_rect, solid(0x2e2e36)));
+
+                                let clip_rect = Bounds {
+                                    origin: point(px(ox + hdr.x + 4.0), px(oy + hdr.y)),
+                                    size: GpuiSize {
+                                        width: px((hdr.w - 8.0).max(0.0)),
+                                        height: px(hdr.h),
+                                    },
+                                };
+                                window.with_content_mask(
+                                    Some(ContentMask { bounds: clip_rect }),
+                                    |window| {
+                                        let _ = hdr.line.paint(
+                                            point(px(ox + hdr.x + 5.0), px(oy + hdr.y + 2.0)),
+                                            px(14.0),
+                                            TextAlign::Left,
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                );
+                            }
+
+                            // 3. Paint leaf tiles inset by 0.5px for crisp 1px dark seams.
                             for tile in &cache.layout.leaves {
                                 let inset = if tile.w > 4.0 && tile.h > 4.0 { 0.5 } else { 0.0 };
                                 let tw = (tile.w - inset * 2.0).max(1.0);
@@ -315,8 +462,7 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                 window.paint_quad(fill(rect, solid(tile.color_hex)));
                             }
 
-                            // Subtle cluster frames for top-level directories/drives.
-                            let frame_color = solid(BG_HOVER);
+                            // 4. Re-stroke depth-1 frames subtly on top so outer folder borders stay razor-sharp.
                             for frame in &cache.layout.frames {
                                 if frame.depth == 1 {
                                     let rect = Bounds {
@@ -328,13 +474,13 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                     };
                                     window.paint_quad(outline(
                                         rect,
-                                        frame_color,
+                                        solid(0x3f3f46),
                                         BorderStyle::Solid,
                                     ));
                                 }
                             }
 
-                            // Selected node highlight (2px accent border; skip outer rim when root itself is selected)
+                            // 5. Selected node highlight (2px accent border; skip outer rim when root is selected)
                             if let Some(sel_id) = selected_node
                                 && sel_id != treemap_root
                                 && let Some(sel) = cache.layout.rect_for_node(sel_id)
@@ -356,7 +502,7 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                 });
                             }
 
-                            // Hovered tile highlight (translucent sheen + 1px crisp white outline)
+                            // 6. Hovered tile/folder highlight
                             if let Some(hov_id) = hovered_node
                                 && let Some(hov) = cache.layout.rect_for_node(hov_id)
                             {
@@ -370,7 +516,7 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                 window.paint_quad(PaintQuad {
                                     bounds: rect,
                                     corner_radii: (0.).into(),
-                                    background: hsla(0., 0., 1., 0.16).into(),
+                                    background: hsla(0., 0., 1., 0.14).into(),
                                     border_widths: px(1.).into(),
                                     border_color: solid(TEXT_PRIMARY),
                                     border_style: BorderStyle::Solid,
