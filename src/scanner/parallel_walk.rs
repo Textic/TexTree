@@ -9,7 +9,8 @@ use rayon::prelude::*;
 
 use crate::models::tree::ExtInterner;
 use crate::models::{
-    DiskTree, DriveKind, FileNode, NodeFlags, NodeId, ScanEngineKind, SortSpec, VolumeInfo,
+    DiskTree, DriveKind, FileNode, NodeFlags, NodeId, ScanEngineKind, ScanMode, SortSpec,
+    VolumeInfo,
 };
 use crate::platform::{self, cluster_size_for_path};
 use crate::scanner::{ScanEvent, ScanProgress, ScanTarget, ntfs_mft};
@@ -83,6 +84,7 @@ pub fn run_scan(
     target: ScanTarget,
     volumes: Vec<VolumeInfo>,
     sort: SortSpec,
+    scan_mode: ScanMode,
     prefer_ntfs_mft: bool,
     cancel: Arc<AtomicBool>,
     tx: UnboundedSender<ScanEvent>,
@@ -102,7 +104,15 @@ pub fn run_scan(
         }
     });
 
-    let result = execute_scan(&target, &volumes, sort, prefer_ntfs_mft, &counters, &cancel);
+    let result = execute_scan(
+        &target,
+        &volumes,
+        sort,
+        scan_mode,
+        prefer_ntfs_mft,
+        &counters,
+        &cancel,
+    );
     done.store(true, Ordering::Relaxed);
     let _ = ticker.join();
 
@@ -130,25 +140,42 @@ pub fn scan_directory_sync(path: &Path, sort: SortSpec) -> Result<DiskTree, Stri
         &ScanTarget::Folder(path.to_path_buf()),
         &[],
         sort,
+        ScanMode::Standard,
         false,
         &counters,
         &cancel,
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeEngineUsed {
+    ServiceMft,
+    DirectMft,
+    ParallelWalk,
+}
+
 fn scan_single_volume(
     vol: &VolumeInfo,
-    try_mft: bool,
+    try_service: bool,
+    try_direct_mft: bool,
     counters: &ScanCounters,
     cancel: &AtomicBool,
-) -> (TempNode, bool) {
+) -> (TempNode, VolumeEngineUsed) {
     let root_name = vol.root_path.to_string_lossy().into_owned();
-    if try_mft && vol.file_system.eq_ignore_ascii_case("NTFS") {
-        if let Ok(mut node) =
-            ntfs_mft::scan_volume_mft(&vol.short_name, &root_name, counters, cancel)
+    if vol.file_system.eq_ignore_ascii_case("NTFS") {
+        if try_service
+            && let Ok(mut node) =
+                platform::scan_volume_via_service(&vol.short_name, &root_name, counters, cancel)
         {
             node.flags |= NodeFlags::IS_VOLUME;
-            return (node, true);
+            return (node, VolumeEngineUsed::ServiceMft);
+        }
+        if try_direct_mft
+            && let Ok(mut node) =
+                ntfs_mft::scan_volume_mft(&vol.short_name, &root_name, counters, cancel)
+        {
+            node.flags |= NodeFlags::IS_VOLUME;
+            return (node, VolumeEngineUsed::DirectMft);
         }
     }
 
@@ -163,19 +190,27 @@ fn scan_single_volume(
         cancel,
     );
     node.flags |= NodeFlags::IS_VOLUME;
-    (node, false)
+    (node, VolumeEngineUsed::ParallelWalk)
 }
 
 fn execute_scan(
     target: &ScanTarget,
     volumes: &[VolumeInfo],
     sort: SortSpec,
+    scan_mode: ScanMode,
     prefer_ntfs_mft: bool,
     counters: &ScanCounters,
     cancel: &AtomicBool,
 ) -> Result<DiskTree, String> {
     let started = Instant::now();
-    let try_mft = prefer_ntfs_mft && platform::is_elevated();
+    let service_running =
+        cfg!(target_os = "windows") && platform::query_service_status() == platform::ServiceStatus::Running;
+    let try_service = scan_mode == ScanMode::Service && service_running;
+    let try_direct_mft = match scan_mode {
+        ScanMode::Standard => false,
+        ScanMode::AdminMft => prefer_ntfs_mft && platform::is_elevated(),
+        ScanMode::Service => !try_service && prefer_ntfs_mft && platform::is_elevated(),
+    };
 
     let mut tree = match target {
         ScanTarget::AllFixedDrives => {
@@ -193,19 +228,29 @@ fn execute_scan(
                 return Err("No mounted drives found to scan.".to_string());
             }
 
-            let results: Vec<(TempNode, bool)> = scan_vols
+            let results: Vec<(TempNode, VolumeEngineUsed)> = scan_vols
                 .into_par_iter()
-                .map(|vol| scan_single_volume(&vol, try_mft, counters, cancel))
+                .map(|vol| scan_single_volume(&vol, try_service, try_direct_mft, counters, cancel))
                 .collect();
 
             if cancel.load(Ordering::Relaxed) {
                 return Err("Scan cancelled".to_string());
             }
 
-            let mft_count = results.iter().filter(|(_, used_mft)| *used_mft).count();
-            let engine = if mft_count == results.len() {
+            let service_count = results
+                .iter()
+                .filter(|(_, e)| *e == VolumeEngineUsed::ServiceMft)
+                .count();
+            let direct_count = results
+                .iter()
+                .filter(|(_, e)| *e == VolumeEngineUsed::DirectMft)
+                .count();
+            let mft_total = service_count + direct_count;
+            let engine = if service_count == results.len() {
+                ScanEngineKind::NtfsMftService
+            } else if direct_count == results.len() {
                 ScanEngineKind::NtfsMft
-            } else if mft_count > 0 {
+            } else if mft_total > 0 {
                 ScanEngineKind::Hybrid
             } else {
                 ScanEngineKind::ParallelWalk
@@ -226,7 +271,8 @@ fn execute_scan(
             disk_tree
         }
         ScanTarget::Volume(vol) => {
-            let (sub, used_mft) = scan_single_volume(vol, try_mft, counters, cancel);
+            let (sub, engine_used) =
+                scan_single_volume(vol, try_service, try_direct_mft, counters, cancel);
             if cancel.load(Ordering::Relaxed) {
                 return Err("Scan cancelled".to_string());
             }
@@ -235,10 +281,10 @@ fn execute_scan(
                 Some(vol.root_path.clone()),
                 target.display_label(),
             );
-            disk_tree.engine = if used_mft {
-                ScanEngineKind::NtfsMft
-            } else {
-                ScanEngineKind::ParallelWalk
+            disk_tree.engine = match engine_used {
+                VolumeEngineUsed::ServiceMft => ScanEngineKind::NtfsMftService,
+                VolumeEngineUsed::DirectMft => ScanEngineKind::NtfsMft,
+                VolumeEngineUsed::ParallelWalk => ScanEngineKind::ParallelWalk,
             };
             disk_tree
         }

@@ -83,12 +83,48 @@ impl SizeUnit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScanMode {
+    Service,
+    #[default]
+    AdminMft,
+    Standard,
+}
+
+impl ScanMode {
+    pub const ALL: [Self; 3] = [Self::Service, Self::AdminMft, Self::Standard];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Service => "MFT Service (No UAC)",
+            Self::AdminMft => "Admin Mode (UAC)",
+            Self::Standard => "Standard (Parallel Walk)",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Service => {
+                "Read-only background service for instant NTFS MFT scans, protected folders, and elevated lock detection with zero UAC prompts."
+            }
+            Self::AdminMft => {
+                "Portable direct NTFS MFT mode without installing a background service. Prompts Windows UAC when elevating."
+            }
+            Self::Standard => {
+                "Zero-privilege parallel Win32 scanner. 100% portable with no UAC prompts or background service."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
     pub accent: AccentPreset,
     #[serde(default)]
     pub size_unit: SizeUnit,
+    #[serde(default)]
+    pub scan_mode: ScanMode,
     #[serde(default = "default_true")]
     pub show_hidden_files: bool,
     #[serde(default = "default_true")]
@@ -97,6 +133,10 @@ pub struct AppSettings {
     pub auto_scan_on_launch: bool,
     #[serde(default = "default_true")]
     pub prefer_ntfs_mft: bool,
+    #[serde(default)]
+    pub always_run_as_admin: bool,
+    #[serde(default)]
+    pub admin_prompt_shown: bool,
     #[serde(default = "default_true")]
     pub show_treemap: bool,
     #[serde(default = "default_true")]
@@ -112,10 +152,13 @@ impl Default for AppSettings {
         Self {
             accent: AccentPreset::Emerald,
             size_unit: SizeUnit::Binary,
+            scan_mode: ScanMode::AdminMft,
             show_hidden_files: true,
             confirm_before_trash: true,
             auto_scan_on_launch: true,
             prefer_ntfs_mft: true,
+            always_run_as_admin: false,
+            admin_prompt_shown: false,
             show_treemap: true,
             auto_check_updates: true,
         }
@@ -157,21 +200,27 @@ mod tests {
     fn defaults_to_obsidian_emerald_and_roundtrips_json() {
         let defaults = AppSettings::default();
         assert_eq!(defaults.accent, AccentPreset::Emerald);
+        assert_eq!(defaults.scan_mode, ScanMode::AdminMft);
         assert_eq!(defaults.accent.primary_hex(), 0x34d399);
         assert!(defaults.show_hidden_files);
         assert!(defaults.confirm_before_trash);
         assert!(defaults.auto_scan_on_launch);
         assert!(defaults.prefer_ntfs_mft);
+        assert!(!defaults.always_run_as_admin);
+        assert!(!defaults.admin_prompt_shown);
         assert!(defaults.show_treemap);
         assert!(defaults.auto_check_updates);
 
         let custom = AppSettings {
             accent: AccentPreset::Violet,
             size_unit: SizeUnit::Decimal,
+            scan_mode: ScanMode::Service,
             show_hidden_files: false,
             confirm_before_trash: true,
             auto_scan_on_launch: false,
             prefer_ntfs_mft: false,
+            always_run_as_admin: true,
+            admin_prompt_shown: true,
             show_treemap: false,
             auto_check_updates: false,
         };
@@ -179,10 +228,19 @@ mod tests {
         let parsed: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.accent, AccentPreset::Violet);
         assert_eq!(parsed.size_unit, SizeUnit::Decimal);
+        assert_eq!(parsed.scan_mode, ScanMode::Service);
         assert!(!parsed.show_hidden_files);
         assert!(!parsed.auto_scan_on_launch);
         assert!(!parsed.prefer_ntfs_mft);
+        assert!(parsed.always_run_as_admin);
+        assert!(parsed.admin_prompt_shown);
         assert!(!parsed.show_treemap);
         assert!(!parsed.auto_check_updates);
+
+        // Legacy settings JSON without newer admin/mode flags must deserialize safely.
+        let legacy: AppSettings = serde_json::from_str(r#"{"accent":"Emerald"}"#).unwrap();
+        assert!(!legacy.always_run_as_admin);
+        assert!(!legacy.admin_prompt_shown);
+        assert_eq!(legacy.scan_mode, ScanMode::AdminMft);
     }
 }

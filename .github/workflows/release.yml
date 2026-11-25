@@ -161,6 +161,7 @@ jobs:
           cargo build --release --target ${{ matrix.target }}
           & .\packaging\windows\build-setup.ps1 `
             -BinaryPath "target\${{ matrix.target }}\release\textree.exe" `
+            -ServiceBinaryPath "target\${{ matrix.target }}\release\textree-service.exe" `
             -Version "${{ needs.prepare.outputs.version }}" `
             -Tag "${{ needs.prepare.outputs.tag }}" `
             -OutDir "dist"

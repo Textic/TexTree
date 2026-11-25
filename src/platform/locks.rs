@@ -11,6 +11,7 @@ pub struct LockingProcess {
 pub enum FileLockStatus {
     #[default]
     NotChecked,
+    #[allow(dead_code)]
     Checking,
     NotApplicable,
     Unlocked,

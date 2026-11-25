@@ -1,15 +1,17 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use futures_channel::mpsc::unbounded;
 use futures_util::StreamExt as _;
 use gpui_kit::{
-    ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, PathPromptOptions,
-    Pixels, Point, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
-    WindowControlArea,
+    ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseMoveEvent,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Subscription,
+    UniformListScrollHandle, Window, WindowControlArea,
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -17,16 +19,17 @@ use gpui_kit::{
         h_flex,
         input::{Input, InputEvent, InputState},
         resizable::{h_resizable, resizable_panel, v_resizable},
+        tooltip::Tooltip,
         v_flex,
     },
     div, prelude::*, px,
 };
 
 use crate::models::{
-    AccentPreset, AppSettings, DiskTree, ExtensionStat, NodeId, SizeUnit, SortColumn, SortSpec,
-    VisibleRow, VolumeInfo,
+    AccentPreset, AppSettings, DiskTree, ExtensionStat, NodeId, ScanMode, SizeUnit, SortColumn,
+    SortSpec, VisibleRow, VolumeInfo,
 };
-use crate::platform::{self, FileLockStatus};
+use crate::platform::{self, FileLockStatus, ServiceStatus};
 use crate::scanner::{self, ScanEvent, ScanProgress, ScanTarget};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
@@ -77,15 +80,48 @@ pub enum ScanState {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScanCacheKey {
+    AllFixedDrives,
+    Volume(String),
+    Folder(PathBuf),
+}
+
+impl ScanCacheKey {
+    pub fn from_target(target: &ScanTarget) -> Self {
+        match target {
+            ScanTarget::AllFixedDrives => Self::AllFixedDrives,
+            ScanTarget::Volume(v) => Self::Volume(
+                v.root_path
+                    .to_string_lossy()
+                    .replace('/', "\\")
+                    .to_ascii_uppercase(),
+            ),
+            ScanTarget::Folder(p) => Self::Folder(p.clone()),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CachedScan {
+    pub tree: Arc<DiskTree>,
+    pub scanned_at: Instant,
+    pub from_all_drives: bool,
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     pub settings: AppSettings,
     pub is_elevated: bool,
+    pub service_status: ServiceStatus,
+    pub service_busy: bool,
     pub volumes: Vec<VolumeInfo>,
     pub selected_target: ScanTarget,
     pub scan_state: ScanState,
     cancel_token: Option<Arc<AtomicBool>>,
     scan_seq: u64,
+    pub scan_cache: HashMap<ScanCacheKey, CachedScan>,
+    pub current_scan_from_cache: bool,
     pub tree: Option<Arc<DiskTree>>,
     pub tree_version: u64,
     pub active_tab: MainTab,
@@ -97,6 +133,7 @@ pub struct Workspace {
     pub selected_has_fs_path: bool,
     pub treemap_root: Option<NodeId>,
     pub treemap_hovered: Option<NodeId>,
+    pub list_hovered: Option<NodeId>,
     pub treemap_cache: Rc<RefCell<TreemapCanvasCache>>,
     pub visible_rows: Vec<VisibleRow>,
     pub top_file_rows: Vec<NodeId>,
@@ -116,6 +153,7 @@ pub struct Workspace {
     pub settings_category: SettingsCategory,
     pub pending_confirm: Option<PendingConfirm>,
     pub toast_message: Option<(String, bool)>,
+    pub dismissed_admin_banner: bool,
     pub update_state: UpdateState,
     pub last_update_info: Option<UpdateInfo>,
     _subscriptions: Vec<Subscription>,
@@ -144,11 +182,15 @@ impl Workspace {
             focus_handle,
             settings,
             is_elevated: platform::is_elevated(),
+            service_status: platform::query_service_status(),
+            service_busy: false,
             volumes,
             selected_target,
             scan_state: ScanState::Idle,
             cancel_token: None,
             scan_seq: 0,
+            scan_cache: HashMap::new(),
+            current_scan_from_cache: false,
             tree: None,
             tree_version: 0,
             active_tab: MainTab::Tree,
@@ -160,6 +202,7 @@ impl Workspace {
             selected_has_fs_path: false,
             treemap_root: None,
             treemap_hovered: None,
+            list_hovered: None,
             treemap_cache: Rc::new(RefCell::new(TreemapCanvasCache::default())),
             visible_rows: Vec::new(),
             top_file_rows: Vec::new(),
@@ -179,6 +222,7 @@ impl Workspace {
             settings_category: SettingsCategory::Appearance,
             pending_confirm: None,
             toast_message: None,
+            dismissed_admin_banner: false,
             update_state: UpdateState::Idle,
             last_update_info: None,
             _subscriptions: vec![search_sub],
@@ -198,6 +242,99 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn has_mft_privileges(&self) -> bool {
+        self.is_elevated
+            || (self.settings.scan_mode == ScanMode::Service
+                && self.service_status == ServiceStatus::Running)
+    }
+
+    pub fn has_cached_target(&self, target: &ScanTarget) -> bool {
+        let key = ScanCacheKey::from_target(target);
+        if self.scan_cache.contains_key(&key) {
+            return true;
+        }
+        if let ScanTarget::Volume(vol) = target
+            && let Some(all) = self.scan_cache.get(&ScanCacheKey::AllFixedDrives)
+        {
+            return all.tree.find_volume_child(&vol.root_path).is_some();
+        }
+        false
+    }
+
+    /// Switches immediately to a cached session scan if available (including extracting a single
+    /// drive subtree instantaneously from a cached `Entire PC` scan); otherwise starts a fresh scan.
+    pub fn select_or_scan_target(&mut self, target: ScanTarget, cx: &mut Context<Self>) {
+        let is_scanning = matches!(self.scan_state, ScanState::Scanning(_));
+        if !is_scanning && self.tree.is_some() && self.selected_target == target {
+            return;
+        }
+
+        let key = ScanCacheKey::from_target(&target);
+        if let Some(cached) = self.scan_cache.get(&key).cloned() {
+            if let Some(prev) = self.cancel_token.take() {
+                prev.store(true, Ordering::Relaxed);
+            }
+            self.scan_seq = self.scan_seq.wrapping_add(1);
+            self.selected_target = target;
+            self.scan_state = ScanState::Ready;
+            self.toast_message = None;
+            self.apply_loaded_tree(cached.tree, true);
+            cx.notify();
+            return;
+        }
+
+        if let ScanTarget::Volume(vol) = &target
+            && let Some(all_cached) = self.scan_cache.get(&ScanCacheKey::AllFixedDrives).cloned()
+            && let Some(vol_node_id) = all_cached.tree.find_volume_child(&vol.root_path)
+            && let Some(sub_tree) = all_cached.tree.extract_subtree(
+                vol_node_id,
+                target.display_label(),
+                Some(vol.root_path.clone()),
+            )
+        {
+            if let Some(prev) = self.cancel_token.take() {
+                prev.store(true, Ordering::Relaxed);
+            }
+            self.scan_seq = self.scan_seq.wrapping_add(1);
+            let arc_sub = Arc::new(sub_tree);
+            self.scan_cache.insert(
+                key,
+                CachedScan {
+                    tree: arc_sub.clone(),
+                    scanned_at: all_cached.scanned_at,
+                    from_all_drives: true,
+                },
+            );
+            self.selected_target = target;
+            self.scan_state = ScanState::Ready;
+            self.toast_message = None;
+            self.apply_loaded_tree(arc_sub, true);
+            cx.notify();
+            return;
+        }
+
+        self.start_scan(target, cx);
+    }
+
+    fn apply_loaded_tree(&mut self, tree: Arc<DiskTree>, from_cache: bool) {
+        let root_id = tree.root;
+        let mut expanded = HashSet::new();
+        expanded.insert(root_id);
+        self.tree = Some(tree);
+        self.tree_version = self.tree_version.wrapping_add(1);
+        self.current_scan_from_cache = from_cache;
+        self.expanded = expanded;
+        self.selected_node = Some(root_id);
+        self.treemap_root = Some(root_id);
+        self.treemap_hovered = None;
+        self.list_hovered = None;
+        self.lock_status = FileLockStatus::NotApplicable;
+        self.ext_filter = None;
+        self.denied_only_filter = false;
+        self.refresh_selection_cache();
+        self.rebuild_cached_views();
+    }
+
     pub fn start_scan(&mut self, target: ScanTarget, cx: &mut Context<Self>) {
         if let Some(prev) = self.cancel_token.take() {
             prev.store(true, Ordering::Relaxed);
@@ -205,18 +342,41 @@ impl Workspace {
 
         self.scan_seq = self.scan_seq.wrapping_add(1);
         let seq = self.scan_seq;
+        let cache_key = ScanCacheKey::from_target(&target);
+        let is_all_drives = matches!(target, ScanTarget::AllFixedDrives);
         self.selected_target = target.clone();
         self.scan_state = ScanState::Scanning(ScanProgress::default());
         self.toast_message = None;
+        self.current_scan_from_cache = false;
+
+        // Immediately clear previous drive/target data so stale items never stay visible
+        // while the newly selected target is being scanned.
+        self.tree = None;
+        self.tree_version = self.tree_version.wrapping_add(1);
+        self.expanded.clear();
+        self.selected_node = None;
+        self.selected_top_children.clear();
+        self.selected_full_path = None;
+        self.selected_has_fs_path = false;
+        self.treemap_root = None;
+        self.treemap_hovered = None;
+        self.list_hovered = None;
+        self.visible_rows.clear();
+        self.top_file_rows.clear();
+        self.extension_rows.clear();
+        self.ext_filter = None;
+        self.denied_only_filter = false;
+        self.lock_status = FileLockStatus::NotChecked;
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_token = Some(cancel.clone());
         let (tx, mut rx) = unbounded::<ScanEvent>();
         let volumes = self.volumes.clone();
         let sort = self.sort;
+        let scan_mode = self.settings.scan_mode;
         let prefer_mft = self.settings.prefer_ntfs_mft;
 
-        scanner::spawn_scan(target, volumes, sort, prefer_mft, cancel, tx);
+        scanner::spawn_scan(target, volumes, sort, scan_mode, prefer_mft, cancel, tx);
 
         cx.spawn(async move |this, cx| {
             while let Some(evt) = rx.next().await {
@@ -234,21 +394,22 @@ impl Workspace {
                         ScanEvent::Completed(tree) => {
                             this.cancel_token = None;
                             this.scan_state = ScanState::Ready;
-                            let root_id = tree.root;
-                            let mut expanded = HashSet::new();
-                            expanded.insert(root_id);
-                            this.tree = Some(Arc::new(tree));
-                            this.tree_version = this.tree_version.wrapping_add(1);
-                            this.expanded = expanded;
-                            this.selected_node = Some(root_id);
-                            this.treemap_root = Some(root_id);
-                            this.treemap_hovered = None;
-                            this.lock_status = FileLockStatus::NotApplicable;
-                            this.ext_filter = None;
-                            this.denied_only_filter = false;
-                            this.refresh_selection_cache();
-                            this.rebuild_cached_views();
+                            let arc_tree = Arc::new(tree);
+                            if is_all_drives {
+                                // Drop stale sub-volume entries previously extracted from an older Entire PC scan.
+                                this.scan_cache.retain(|_, v| !v.from_all_drives);
+                            }
+                            this.scan_cache.insert(
+                                cache_key.clone(),
+                                CachedScan {
+                                    tree: arc_tree.clone(),
+                                    scanned_at: Instant::now(),
+                                    from_all_drives: false,
+                                },
+                            );
+                            this.apply_loaded_tree(arc_tree, false);
                             this.volumes = platform::list_volumes();
+                            this.service_status = platform::query_service_status();
                             cx.notify();
                             should_stop = true;
                         }
@@ -327,6 +488,25 @@ impl Workspace {
     pub fn set_active_tab(&mut self, tab: MainTab, cx: &mut Context<Self>) {
         if self.active_tab != tab {
             self.active_tab = tab;
+            self.list_hovered = None;
+            cx.notify();
+        }
+    }
+
+    pub fn set_list_hovered(&mut self, node_id: NodeId, cx: &mut Context<Self>) {
+        if self.list_hovered != Some(node_id) {
+            self.list_hovered = Some(node_id);
+            cx.notify();
+        }
+    }
+
+    pub fn clear_list_hovered(&mut self, expected: Option<NodeId>, cx: &mut Context<Self>) {
+        let should_clear = match expected {
+            Some(id) => self.list_hovered == Some(id),
+            None => self.list_hovered.is_some(),
+        };
+        if should_clear {
+            self.list_hovered = None;
             cx.notify();
         }
     }
@@ -409,9 +589,21 @@ impl Workspace {
         }
 
         self.lock_status = FileLockStatus::Checking;
+        let use_service_locks = self.settings.scan_mode == ScanMode::Service
+            && self.service_status == ServiceStatus::Running
+            && !self.is_elevated;
         let (tx, mut rx) = unbounded::<FileLockStatus>();
         std::thread::spawn(move || {
-            let status = platform::inspect_file_lock(&path);
+            let mut status = platform::inspect_file_lock(&path);
+            if use_service_locks
+                && matches!(
+                    status,
+                    FileLockStatus::LockedUnknown | FileLockStatus::AccessDenied
+                )
+                && let Some(svc_status) = platform::inspect_file_lock_via_service(&path)
+            {
+                status = svc_status;
+            }
             let _ = tx.unbounded_send(status);
         });
 
@@ -582,55 +774,102 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn toggle_admin_prompt_persist(&mut self, cx: &mut Context<Self>) {
+        if let Some(PendingConfirm::AdminMode { persist }) = &mut self.pending_confirm {
+            *persist = !*persist;
+            cx.notify();
+        }
+    }
+
     pub fn accept_confirm(&mut self, cx: &mut Context<Self>) {
         let Some(action) = self.pending_confirm.take() else {
             return;
         };
-        let PendingConfirm::TrashItem {
-            node_id,
-            name,
-            path,
-            ..
-        } = action;
-
-        let (tx, mut rx) = unbounded::<Result<(), String>>();
-        std::thread::spawn(move || {
-            let res = platform::move_to_trash(&path);
-            let _ = tx.unbounded_send(res);
-        });
-
-        cx.spawn(async move |this, cx| {
-            if let Some(res) = rx.next().await {
-                let _ = this.update(cx, |this, cx| match res {
+        match action {
+            PendingConfirm::AdminMode { persist } => {
+                let prev_always = self.settings.always_run_as_admin;
+                let prev_shown = self.settings.admin_prompt_shown;
+                self.settings.always_run_as_admin = persist;
+                self.settings.admin_prompt_shown = true;
+                self.settings.save();
+                match platform::relaunch_as_admin() {
                     Ok(()) => {
-                        let parent_id = this
-                            .tree
-                            .as_ref()
-                            .and_then(|t| t.get(node_id))
-                            .and_then(|n| n.parent);
-                        if let Some(tree) = &mut this.tree {
-                            Arc::make_mut(tree).remove_subtree_soft(node_id);
-                            this.tree_version = this.tree_version.wrapping_add(1);
-                        }
-                        this.selected_node = parent_id;
-                        this.treemap_hovered = None;
-                        this.lock_status = FileLockStatus::NotApplicable;
-                        this.refresh_selection_cache();
-                        this.rebuild_cached_views();
-                        this.volumes = platform::list_volumes();
-                        this.toast_message =
-                            Some((format!("Moved \"{name}\" to Recycle Bin."), false));
-                        cx.notify();
+                        cx.quit();
                     }
                     Err(err) => {
-                        this.toast_message = Some((err, true));
+                        self.settings.always_run_as_admin = prev_always;
+                        self.settings.admin_prompt_shown = prev_shown;
+                        self.settings.save();
+                        self.toast_message = Some((err, true));
                         cx.notify();
                     }
-                });
+                }
             }
-        })
-        .detach();
-        cx.notify();
+            PendingConfirm::TrashItem {
+                node_id,
+                name,
+                path,
+                ..
+            } => {
+                let trash_path = path.clone();
+                let (tx, mut rx) = unbounded::<Result<(), String>>();
+                std::thread::spawn(move || {
+                    let res = platform::move_to_trash(&path);
+                    let _ = tx.unbounded_send(res);
+                });
+
+                cx.spawn(async move |this, cx| {
+                    if let Some(res) = rx.next().await {
+                        let _ = this.update(cx, |this, cx| match res {
+                            Ok(()) => {
+                                let parent_id = this
+                                    .tree
+                                    .as_ref()
+                                    .and_then(|t| t.get(node_id))
+                                    .and_then(|n| n.parent);
+                                if let Some(tree) = &mut this.tree {
+                                    Arc::make_mut(tree).remove_subtree_soft(node_id);
+                                    this.tree_version = this.tree_version.wrapping_add(1);
+                                }
+                                let current_key = ScanCacheKey::from_target(&this.selected_target);
+                                if let Some(tree) = this.tree.clone()
+                                    && let Some(entry) = this.scan_cache.get_mut(&current_key)
+                                {
+                                    entry.tree = tree;
+                                }
+                                for (k, entry) in this.scan_cache.iter_mut() {
+                                    if *k == current_key {
+                                        continue;
+                                    }
+                                    if let Some(other_id) =
+                                        entry.tree.find_node_by_path(&trash_path)
+                                    {
+                                        Arc::make_mut(&mut entry.tree)
+                                            .remove_subtree_soft(other_id);
+                                    }
+                                }
+                                this.selected_node = parent_id;
+                                this.treemap_hovered = None;
+                                this.list_hovered = None;
+                                this.lock_status = FileLockStatus::NotApplicable;
+                                this.refresh_selection_cache();
+                                this.rebuild_cached_views();
+                                this.volumes = platform::list_volumes();
+                                this.toast_message =
+                                    Some((format!("Moved \"{name}\" to Recycle Bin."), false));
+                                cx.notify();
+                            }
+                            Err(err) => {
+                                this.toast_message = Some((err, true));
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .detach();
+                cx.notify();
+            }
+        }
     }
 
     // --- Settings mutators ---
@@ -669,6 +908,9 @@ impl Workspace {
 
     pub fn toggle_treemap(&mut self, cx: &mut Context<Self>) {
         self.settings.show_treemap = !self.settings.show_treemap;
+        if !self.settings.show_treemap {
+            self.treemap_hovered = None;
+        }
         self.settings.save();
         cx.notify();
     }
@@ -679,7 +921,126 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn toggle_always_run_as_admin(&mut self, cx: &mut Context<Self>) {
+        self.settings.always_run_as_admin = !self.settings.always_run_as_admin;
+        self.settings.admin_prompt_shown = true;
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub fn set_scan_mode(&mut self, mode: ScanMode, cx: &mut Context<Self>) {
+        if self.settings.scan_mode == mode {
+            return;
+        }
+        self.settings.scan_mode = mode;
+        if mode == ScanMode::Service {
+            self.settings.always_run_as_admin = false;
+        }
+        self.settings.save();
+        self.scan_cache.clear();
+        self.service_status = platform::query_service_status();
+        self.toast_message = Some((format!("Scan mode set to {}.", mode.label()), false));
+        cx.notify();
+    }
+
+    pub fn open_scanning_settings(&mut self, cx: &mut Context<Self>) {
+        self.pending_confirm = None;
+        self.settings_category = SettingsCategory::Scanning;
+        self.show_settings = true;
+        self.service_status = platform::query_service_status();
+        cx.notify();
+    }
+
+    pub fn refresh_service_status(&mut self, cx: &mut Context<Self>) {
+        self.service_status = platform::query_service_status();
+        cx.notify();
+    }
+
+    pub fn install_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action("install", cx);
+    }
+
+    pub fn start_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action("start", cx);
+    }
+
+    pub fn uninstall_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action("uninstall", cx);
+    }
+
+    fn run_service_action(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        if self.service_busy {
+            return;
+        }
+        self.service_busy = true;
+        cx.notify();
+
+        let (tx, mut rx) = unbounded::<Result<(), String>>();
+        std::thread::spawn(move || {
+            let res = match action {
+                "install" => platform::install_service_elevated(),
+                "start" => platform::start_service_elevated(),
+                "uninstall" => platform::uninstall_service_elevated(),
+                _ => Err("Unknown service action.".to_string()),
+            };
+            let _ = tx.unbounded_send(res);
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Some(res) = rx.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.service_busy = false;
+                    this.service_status = platform::query_service_status();
+                    this.scan_cache.clear();
+                    match res {
+                        Ok(()) => match action {
+                            "install" | "start" => {
+                                this.settings.scan_mode = ScanMode::Service;
+                                this.settings.always_run_as_admin = false;
+                                this.settings.save();
+                                this.toast_message = Some((
+                                    "TexTree MFT Service is active (no UAC needed).".to_string(),
+                                    false,
+                                ));
+                            }
+                            "uninstall" => {
+                                if this.settings.scan_mode == ScanMode::Service {
+                                    this.settings.scan_mode = ScanMode::AdminMft;
+                                    this.settings.save();
+                                }
+                                this.toast_message =
+                                    Some(("TexTree MFT Service uninstalled.".to_string(), false));
+                            }
+                            _ => {}
+                        },
+                        Err(err) => {
+                            this.toast_message = Some((err, true));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn dismiss_admin_banner(&mut self, cx: &mut Context<Self>) {
+        self.dismissed_admin_banner = true;
+        cx.notify();
+    }
+
     pub fn relaunch_as_admin(&mut self, cx: &mut Context<Self>) {
+        if self.is_elevated {
+            return;
+        }
+        if cfg!(target_os = "windows")
+            && !self.settings.admin_prompt_shown
+            && !self.settings.always_run_as_admin
+        {
+            self.pending_confirm = Some(PendingConfirm::AdminMode { persist: true });
+            cx.notify();
+            return;
+        }
         match platform::relaunch_as_admin() {
             Ok(()) => {
                 self.settings.save();
@@ -717,12 +1078,33 @@ impl Workspace {
         }
     }
 
+    pub fn clear_treemap_hover(&mut self, cx: &mut Context<Self>) {
+        if self.treemap_hovered.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn sync_treemap_hover_bounds(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.treemap_hovered.is_none() {
+            return;
+        }
+        let inside = self.treemap_cache.borrow().bounds.contains(&position);
+        if !inside {
+            self.treemap_hovered = None;
+            cx.notify();
+        }
+    }
+
     pub fn handle_treemap_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let hit = {
             let cache = self.treemap_cache.borrow();
-            let lx = f32::from(position.x) - f32::from(cache.origin.x);
-            let ly = f32::from(position.y) - f32::from(cache.origin.y);
-            cache.layout.hit_test(lx, ly).map(|r| r.node_id)
+            if !cache.bounds.contains(&position) {
+                None
+            } else {
+                let lx = f32::from(position.x) - f32::from(cache.origin.x);
+                let ly = f32::from(position.y) - f32::from(cache.origin.y);
+                cache.layout.hit_test(lx, ly).map(|r| r.node_id)
+            }
         };
         if self.treemap_hovered != hit {
             self.treemap_hovered = hit;
@@ -1245,9 +1627,41 @@ impl Workspace {
                         )
                     })
                     .when(cfg!(target_os = "windows"), |row| {
-                        if self.is_elevated {
+                        let service_active = self.settings.scan_mode == ScanMode::Service
+                            && self.service_status == ServiceStatus::Running;
+                        if service_active {
                             row.child(
                                 h_flex()
+                                    .id("hdr-service-active")
+                                    .px_2()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(soft_tint(STATUS_SUCCESS, 0.14))
+                                    .border_1()
+                                    .border_color(soft_tint(STATUS_SUCCESS, 0.30))
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(STATUS_SUCCESS))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(soft_tint(STATUS_SUCCESS, 0.22)))
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(
+                                            "TexTree Read-Only MFT Service active: instant NTFS MFT scans, protected system folders, and elevated lock inspection without UAC prompts. Click to configure Scan Mode.",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_scanning_settings(cx);
+                                    }))
+                                    .child(Icon::new(LucideIcon::ShieldCheck).xsmall())
+                                    .child("Service · MFT"),
+                            )
+                        } else if self.is_elevated {
+                            row.child(
+                                h_flex()
+                                    .id("hdr-admin-active")
                                     .px_1p5()
                                     .py_0p5()
                                     .gap_1()
@@ -1259,8 +1673,19 @@ impl Workspace {
                                     .text_xs()
                                     .font_medium()
                                     .text_color(solid(STATUS_SUCCESS))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(soft_tint(STATUS_SUCCESS, 0.22)))
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(
+                                            "Running as Administrator: direct NTFS MFT scans, protected system folders, and elevated file-lock inspection are active. Click to configure Scan Mode.",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_scanning_settings(cx);
+                                    }))
                                     .child(Icon::new(LucideIcon::ShieldCheck).xsmall())
-                                    .child("MFT"),
+                                    .child("Admin · MFT"),
                             )
                         } else {
                             row.child(
@@ -1279,6 +1704,12 @@ impl Workspace {
                                     .text_color(solid(accent.primary_hex()))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(soft_tint(accent.primary_hex(), 0.22)))
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(
+                                            "Switch to Administrator Mode for instant NTFS MFT scans, protected system folders, and elevated file-lock detection (or install the zero-UAC MFT Service in Settings).",
+                                        )
+                                        .build(window, cx)
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.relaunch_as_admin(cx);
                                     }))
@@ -1389,12 +1820,34 @@ impl Workspace {
                     )
                     .when_some(self.tree.as_ref(), |bar, tree| {
                         let root = tree.root_node();
+                        let from_cache = self.current_scan_from_cache;
                         bar.child(
                             h_flex()
                                 .items_center()
                                 .gap_3()
                                 .text_xs()
                                 .text_color(solid(TEXT_MUTED))
+                                .when(from_cache, |row| {
+                                    row.child(
+                                        div()
+                                            .id("subtab-cached-pill")
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded(px(RADIUS_CONTROL))
+                                            .bg(solid(BG_BASE))
+                                            .border_1()
+                                            .border_color(solid(BORDER_SUBTLE))
+                                            .text_xs()
+                                            .text_color(solid(TEXT_SECONDARY))
+                                            .tooltip(|window, cx| {
+                                                Tooltip::new(
+                                                    "Loaded instantly from session cache. Press F5 or click Scan to refresh from disk.",
+                                                )
+                                                .build(window, cx)
+                                            })
+                                            .child("Cached"),
+                                    )
+                                })
                                 .child(SharedString::from(format!(
                                     "Total: {}",
                                     format_size(root.logical_size, unit)
@@ -1410,10 +1863,10 @@ impl Workspace {
                         )
                     }),
             )
-            // Inline live scan banner or scan error banner
+            // Inline live scan banner (only when a tree is already visible)
             .when_some(
                 match &self.scan_state {
-                    ScanState::Scanning(p) => Some(p.clone()),
+                    ScanState::Scanning(p) if self.tree.is_some() => Some(p.clone()),
                     _ => None,
                 },
                 |pane, p| {
@@ -1510,6 +1963,109 @@ impl Workspace {
                     )
                 },
             )
+            // Contextual, dismissible Admin/MFT benefit banner on Windows when MFT privileges are not active
+            .when_some(
+                if cfg!(target_os = "windows")
+                    && !self.has_mft_privileges()
+                    && !self.dismissed_admin_banner
+                    && !matches!(self.scan_state, ScanState::Scanning(_))
+                {
+                    self.tree.as_ref().map(|t| t.root_node().denied_count)
+                } else {
+                    None
+                },
+                |pane, denied_count| {
+                    let has_denied = denied_count > 0;
+                    let banner_tint = if has_denied {
+                        STATUS_WARNING
+                    } else {
+                        accent.primary_hex()
+                    };
+                    let icon = if has_denied {
+                        LucideIcon::ShieldAlert
+                    } else {
+                        LucideIcon::Zap
+                    };
+                    let message = if has_denied {
+                        format!(
+                            "{} protected path(s) skipped. Admin Mode unlocks fast NTFS MFT, system folders & elevated lock detection.",
+                            format_count(u64::from(denied_count))
+                        )
+                    } else {
+                        "Admin Mode unlocks fast direct NTFS MFT scans, protected system folders & elevated file-lock detection."
+                            .to_string()
+                    };
+                    let cta = if has_denied {
+                        "Switch to Admin"
+                    } else {
+                        "Enable Admin"
+                    };
+
+                    pane.child(
+                        h_flex()
+                            .w_full()
+                            .min_h(px(34.))
+                            .px_3()
+                            .py_1()
+                            .gap_2p5()
+                            .items_center()
+                            .justify_between()
+                            .bg(soft_tint(banner_tint, if has_denied { 0.09 } else { 0.06 }))
+                            .border_b_1()
+                            .border_color(soft_tint(
+                                banner_tint,
+                                if has_denied { 0.28 } else { 0.20 },
+                            ))
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(icon)
+                                            .xsmall()
+                                            .text_color(solid(banner_tint)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(solid(TEXT_PRIMARY))
+                                            .child(SharedString::from(message)),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("banner-relaunch-admin")
+                                            .with_size(Size::XSmall)
+                                            .secondary()
+                                            .icon(LucideIcon::ShieldCheck)
+                                            .label(cta)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.relaunch_as_admin(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("banner-dismiss-admin")
+                                            .with_size(Size::XSmall)
+                                            .ghost()
+                                            .icon(IconName::Close)
+                                            .tooltip("Dismiss for this session")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.dismiss_admin_banner(cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
+            )
             // Active view (with optional split Treemap below) or calm empty state
             .child(div().flex_1().min_h_0().w_full().child(if self.tree.is_none() {
                 self.render_empty_state(cx).into_any_element()
@@ -1538,7 +2094,159 @@ impl Workspace {
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_scanning = matches!(self.scan_state, ScanState::Scanning(_));
+        let accent = self.settings.accent;
+        let unit = self.settings.size_unit;
+
+        if let ScanState::Scanning(p) = &self.scan_state {
+            let target_label = self.selected_target.display_label();
+            let engine_hint = if cfg!(target_os = "windows")
+                && self.settings.scan_mode == ScanMode::Service
+                && self.service_status == ServiceStatus::Running
+            {
+                "Reading NTFS Master File Table via TexTree MFT Service..."
+            } else if cfg!(target_os = "windows")
+                && self.is_elevated
+                && self.settings.scan_mode != ScanMode::Standard
+                && self.settings.prefer_ntfs_mft
+            {
+                "Reading direct NTFS Master File Table and building storage tree..."
+            } else {
+                "Indexing files and folders in parallel..."
+            };
+            let current_path = if p.current_path.is_empty() {
+                "Starting storage scan...".to_string()
+            } else {
+                p.current_path.clone()
+            };
+
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .px_6()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(520.))
+                        .items_center()
+                        .gap_3()
+                        .child(render_app_badge(44.))
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_center()
+                                        .truncate()
+                                        .text_base()
+                                        .font_semibold()
+                                        .text_color(solid(TEXT_PRIMARY))
+                                        .child(SharedString::from(format!(
+                                            "Scanning {target_label}..."
+                                        ))),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(solid(TEXT_MUTED))
+                                        .child(engine_hint),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(scan_metric_card(
+                                    "Files",
+                                    format_count(p.scanned_files),
+                                    TEXT_PRIMARY,
+                                ))
+                                .child(scan_metric_card(
+                                    "Folders",
+                                    format_count(p.scanned_dirs),
+                                    TEXT_PRIMARY,
+                                ))
+                                .child(scan_metric_card(
+                                    "Scanned",
+                                    format_size(p.scanned_bytes, unit),
+                                    accent.primary_hex(),
+                                )),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .px_3()
+                                .py_1p5()
+                                .gap_2()
+                                .items_center()
+                                .rounded(px(RADIUS_ROW))
+                                .bg(solid(BG_SURFACE))
+                                .border_1()
+                                .border_color(solid(BORDER_SUBTLE))
+                                .child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(6.))
+                                        .flex_shrink_0()
+                                        .rounded(px(999.))
+                                        .bg(solid(accent.primary_hex())),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(solid(TEXT_SECONDARY))
+                                        .child(SharedString::from(current_path)),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .text_color(solid(TEXT_MUTED))
+                                                .child(SharedString::from(format!(
+                                                    "Elapsed: {}",
+                                                    format_duration_ms(p.elapsed_ms)
+                                                ))),
+                                        )
+                                        .when(p.denied_count > 0, |row| {
+                                            row.child(
+                                                div()
+                                                    .text_color(solid(STATUS_WARNING))
+                                                    .child(SharedString::from(format!(
+                                                        "{} access denied",
+                                                        format_count(u64::from(p.denied_count))
+                                                    ))),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    Button::new("scanning-stop")
+                                        .with_size(Size::Small)
+                                        .danger()
+                                        .icon(LucideIcon::CircleStop)
+                                        .label("Stop Scan")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.stop_scan(cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
 
         v_flex()
             .size_full()
@@ -1555,51 +2263,69 @@ impl Workspace {
                             .text_sm()
                             .font_semibold()
                             .text_color(solid(TEXT_PRIMARY))
-                            .child(if is_scanning {
-                                "Scanning storage..."
-                            } else {
-                                "Analyze Disk Space"
-                            }),
+                            .child("Analyze Disk Space"),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(solid(TEXT_MUTED))
-                            .child(if is_scanning {
-                                "Building hierarchical size tree in parallel."
-                            } else {
-                                "Choose a drive from the sidebar, scan your entire PC, or pick a folder."
-                            }),
+                            .child(
+                                "Choose a drive from the sidebar, scan your entire PC, or pick a folder.",
+                            ),
                     ),
             )
-            .when(!is_scanning, |col| {
-                col.child(
-                    h_flex()
-                        .pt_1()
-                        .gap_2()
-                        .child(
-                            Button::new("empty-scan-all")
-                                .with_size(Size::Small)
-                                .primary()
-                                .icon(LucideIcon::Monitor)
-                                .label("Scan Entire PC")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.start_scan(ScanTarget::AllFixedDrives, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("empty-pick-folder")
-                                .with_size(Size::Small)
-                                .secondary()
-                                .icon(LucideIcon::FolderSearch)
-                                .label("Scan Folder...")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.pick_folder(window, cx);
-                                })),
-                        ),
-                )
-            })
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .child(
+                        Button::new("empty-scan-all")
+                            .with_size(Size::Small)
+                            .primary()
+                            .icon(LucideIcon::Monitor)
+                            .label("Scan Entire PC")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.start_scan(ScanTarget::AllFixedDrives, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("empty-pick-folder")
+                            .with_size(Size::Small)
+                            .secondary()
+                            .icon(LucideIcon::FolderSearch)
+                            .label("Scan Folder...")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_folder(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
+}
+
+fn scan_metric_card(label: &'static str, value: String, value_color: u32) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .px_3()
+        .py_2()
+        .gap_0p5()
+        .rounded(px(RADIUS_ROW))
+        .bg(solid(BG_SURFACE))
+        .border_1()
+        .border_color(solid(BORDER_SUBTLE))
+        .child(
+            div()
+                .text_xs()
+                .text_color(solid(TEXT_MUTED))
+                .child(label),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_semibold()
+                .text_color(solid(value_color))
+                .child(SharedString::from(value)),
+        )
 }
 
 fn subtab_btn(
@@ -1748,6 +2474,15 @@ impl Render for Workspace {
             .flex_col()
             .bg(solid(BG_BASE))
             .text_color(solid(TEXT_PRIMARY))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.clear_treemap_hover(cx);
+                    this.clear_list_hovered(None, cx);
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.sync_treemap_hover_bounds(event.position, cx);
+            }))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.search_input.update(cx, |s, cx| s.focus(window, cx));
@@ -1796,7 +2531,12 @@ impl Render for Workspace {
                 root.child(render_settings_modal(self, cx))
             })
             .when_some(self.pending_confirm.as_ref(), |root, action| {
-                root.child(render_confirm_modal(action, self.settings.size_unit, cx))
+                root.child(render_confirm_modal(
+                    action,
+                    self.settings.accent,
+                    self.settings.size_unit,
+                    cx,
+                ))
             })
     }
 }

@@ -18,7 +18,7 @@ use crate::theme::{
     STATUS_ERROR, STATUS_INFO, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
     TEXT_SECONDARY, format_count, format_size, format_timestamp, soft_tint, solid,
 };
-use crate::ui::workspace::Workspace;
+use crate::ui::workspace::{ScanState, Workspace};
 
 pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let accent = ws.settings.accent;
@@ -277,7 +277,46 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     "Modified",
                                     format_timestamp(node.modified_secs),
                                     TEXT_SECONDARY,
-                                )),
+                                ))
+                                .when(
+                                    cfg!(target_os = "windows")
+                                        && !ws.has_mft_privileges()
+                                        && (is_denied || node.denied_count > 0),
+                                    |card| {
+                                        card.child(
+                                            v_flex()
+                                                .mt_1()
+                                                .p_2()
+                                                .gap_1p5()
+                                                .rounded(px(RADIUS_CONTROL))
+                                                .bg(soft_tint(STATUS_WARNING, 0.08))
+                                                .border_1()
+                                                .border_color(soft_tint(STATUS_WARNING, 0.25))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(solid(STATUS_WARNING))
+                                                        .child(
+                                                            "Protected system paths require Administrator privileges to inspect.",
+                                                        ),
+                                                )
+                                                .child(
+                                                    h_flex().child(
+                                                        Button::new("insp-admin-denied")
+                                                            .with_size(Size::XSmall)
+                                                            .secondary()
+                                                            .icon(LucideIcon::ShieldCheck)
+                                                            .label("Relaunch as Admin")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.relaunch_as_admin(cx);
+                                                                },
+                                                            )),
+                                                    ),
+                                                ),
+                                        )
+                                    },
+                                ),
                         )
                         .when(!top_children.is_empty(), |col| {
                             col.child(
@@ -402,30 +441,42 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                 ))
                                 .child(render_attribute_badges(node.flags)),
                         )
-                        .child(render_lock_card(&ws.lock_status, cx))
+                        .child(render_lock_card(&ws.lock_status, ws.has_mft_privileges(), cx))
                     })
                     .into_any_element()
             }
-            _ => v_flex()
-                .flex_1()
-                .p_4()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .text_color(solid(TEXT_PRIMARY))
-                        .child("No Selection"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(solid(TEXT_MUTED))
-                        .child("Select any folder or file to inspect details and locks."),
-                )
-                .into_any_element(),
+            _ => {
+                let is_scanning = matches!(ws.scan_state, ScanState::Scanning(_));
+                v_flex()
+                    .flex_1()
+                    .p_4()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(solid(TEXT_PRIMARY))
+                            .child(if is_scanning {
+                                "Scanning Storage..."
+                            } else {
+                                "No Selection"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_center()
+                            .text_color(solid(TEXT_MUTED))
+                            .child(if is_scanning {
+                                "Item details and file locks will appear when the scan finishes."
+                            } else {
+                                "Select any folder or file to inspect details and locks."
+                            }),
+                    )
+                    .into_any_element()
+            }
         })
 }
 
@@ -515,7 +566,11 @@ fn render_attribute_badges(flags: NodeFlags) -> impl IntoElement {
         }))
 }
 
-fn render_lock_card(status: &FileLockStatus, cx: &mut Context<Workspace>) -> impl IntoElement {
+fn render_lock_card(
+    status: &FileLockStatus,
+    is_elevated: bool,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     v_flex()
         .p_2p5()
         .gap_2()
@@ -626,35 +681,87 @@ fn render_lock_card(status: &FileLockStatus, cx: &mut Context<Workspace>) -> imp
                         )
                 }))
                 .into_any_element(),
-            FileLockStatus::LockedUnknown => h_flex()
+            FileLockStatus::LockedUnknown => v_flex()
                 .gap_1p5()
-                .items_center()
                 .child(
-                    Icon::new(LucideIcon::Lock)
-                        .xsmall()
-                        .text_color(solid(STATUS_WARNING)),
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(
+                            Icon::new(LucideIcon::Lock)
+                                .xsmall()
+                                .text_color(solid(STATUS_WARNING)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(solid(STATUS_WARNING))
+                                .child("Locked by an elevated or system process"),
+                        ),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(solid(STATUS_WARNING))
-                        .child("Locked by an elevated or system process"),
-                )
+                .when(cfg!(target_os = "windows") && !is_elevated, |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(solid(TEXT_MUTED))
+                            .child(
+                                "Switch to Admin Mode to inspect elevated or system process locks.",
+                            ),
+                    )
+                    .child(
+                        h_flex().child(
+                            Button::new("insp-admin-lock-unknown")
+                                .with_size(Size::XSmall)
+                                .secondary()
+                                .icon(LucideIcon::ShieldCheck)
+                                .label("Relaunch as Admin")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.relaunch_as_admin(cx);
+                                })),
+                        ),
+                    )
+                })
                 .into_any_element(),
-            FileLockStatus::AccessDenied => h_flex()
+            FileLockStatus::AccessDenied => v_flex()
                 .gap_1p5()
-                .items_center()
                 .child(
-                    Icon::new(LucideIcon::ShieldAlert)
-                        .xsmall()
-                        .text_color(solid(STATUS_ERROR)),
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(
+                            Icon::new(LucideIcon::ShieldAlert)
+                                .xsmall()
+                                .text_color(solid(STATUS_ERROR)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(solid(STATUS_ERROR))
+                                .child("Access denied by OS permissions"),
+                        ),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(solid(STATUS_ERROR))
-                        .child("Access denied by OS permissions"),
-                )
+                .when(cfg!(target_os = "windows") && !is_elevated, |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(solid(TEXT_MUTED))
+                            .child(
+                                "Administrator privileges may be required to inspect this protected file.",
+                            ),
+                    )
+                    .child(
+                        h_flex().child(
+                            Button::new("insp-admin-lock-denied")
+                                .with_size(Size::XSmall)
+                                .secondary()
+                                .icon(LucideIcon::ShieldCheck)
+                                .label("Relaunch as Admin")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.relaunch_as_admin(cx);
+                                })),
+                        ),
+                    )
+                })
                 .into_any_element(),
             FileLockStatus::Error(err) => div()
                 .text_xs()

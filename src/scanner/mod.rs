@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 
 use futures_channel::mpsc::UnboundedSender;
 
-use crate::models::{DiskTree, SortSpec, VolumeInfo};
+use crate::models::{DiskTree, ScanMode, SortSpec, VolumeInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanTarget {
@@ -44,12 +44,13 @@ pub enum ScanEvent {
     Error(String),
 }
 
-/// Launches a background scan (using direct NTFS MFT when elevated & enabled, falling back
-/// transparently to parallel Win32/POSIX walking) and streams progress + final `DiskTree`.
+/// Launches a background scan (using `TexTreeMftService`, direct elevated NTFS MFT,
+/// or parallel Win32/POSIX walking depending on `scan_mode`) and streams progress + final `DiskTree`.
 pub fn spawn_scan(
     target: ScanTarget,
     volumes: Vec<VolumeInfo>,
     sort: SortSpec,
+    scan_mode: ScanMode,
     prefer_ntfs_mft: bool,
     cancel: Arc<AtomicBool>,
     tx: UnboundedSender<ScanEvent>,
@@ -57,7 +58,15 @@ pub fn spawn_scan(
     std::thread::Builder::new()
         .name("textree-scan".to_string())
         .spawn(move || {
-            parallel_walk::run_scan(target, volumes, sort, prefer_ntfs_mft, cancel, tx);
+            parallel_walk::run_scan(
+                target,
+                volumes,
+                sort,
+                scan_mode,
+                prefer_ntfs_mft,
+                cancel,
+                tx,
+            );
         })
         .expect("failed to spawn scanner thread");
 }
