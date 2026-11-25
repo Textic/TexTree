@@ -97,6 +97,8 @@ pub struct AppSettings {
     pub auto_scan_on_launch: bool,
     #[serde(default = "default_true")]
     pub prefer_ntfs_mft: bool,
+    #[serde(default)]
+    pub always_run_as_admin: bool,
     #[serde(default = "default_true")]
     pub show_treemap: bool,
     #[serde(default = "default_true")]
@@ -116,6 +118,7 @@ impl Default for AppSettings {
             confirm_before_trash: true,
             auto_scan_on_launch: true,
             prefer_ntfs_mft: true,
+            always_run_as_admin: false,
             show_treemap: true,
             auto_check_updates: true,
         }
@@ -162,6 +165,7 @@ mod tests {
         assert!(defaults.confirm_before_trash);
         assert!(defaults.auto_scan_on_launch);
         assert!(defaults.prefer_ntfs_mft);
+        assert!(!defaults.always_run_as_admin);
         assert!(defaults.show_treemap);
         assert!(defaults.auto_check_updates);
 
@@ -172,6 +176,7 @@ mod tests {
             confirm_before_trash: true,
             auto_scan_on_launch: false,
             prefer_ntfs_mft: false,
+            always_run_as_admin: true,
             show_treemap: false,
             auto_check_updates: false,
         };
@@ -182,7 +187,12 @@ mod tests {
         assert!(!parsed.show_hidden_files);
         assert!(!parsed.auto_scan_on_launch);
         assert!(!parsed.prefer_ntfs_mft);
+        assert!(parsed.always_run_as_admin);
         assert!(!parsed.show_treemap);
         assert!(!parsed.auto_check_updates);
+
+        // Legacy settings JSON without `always_run_as_admin` must deserialize safely.
+        let legacy: AppSettings = serde_json::from_str(r#"{"accent":"Emerald"}"#).unwrap();
+        assert!(!legacy.always_run_as_admin);
     }
 }

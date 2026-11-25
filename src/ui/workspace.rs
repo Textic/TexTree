@@ -17,6 +17,7 @@ use gpui_kit::{
         h_flex,
         input::{Input, InputEvent, InputState},
         resizable::{h_resizable, resizable_panel, v_resizable},
+        tooltip::Tooltip,
         v_flex,
     },
     div, prelude::*, px,
@@ -116,6 +117,7 @@ pub struct Workspace {
     pub settings_category: SettingsCategory,
     pub pending_confirm: Option<PendingConfirm>,
     pub toast_message: Option<(String, bool)>,
+    pub dismissed_admin_banner: bool,
     pub update_state: UpdateState,
     pub last_update_info: Option<UpdateInfo>,
     _subscriptions: Vec<Subscription>,
@@ -179,6 +181,7 @@ impl Workspace {
             settings_category: SettingsCategory::Appearance,
             pending_confirm: None,
             toast_message: None,
+            dismissed_admin_banner: false,
             update_state: UpdateState::Idle,
             last_update_info: None,
             _subscriptions: vec![search_sub],
@@ -208,6 +211,24 @@ impl Workspace {
         self.selected_target = target.clone();
         self.scan_state = ScanState::Scanning(ScanProgress::default());
         self.toast_message = None;
+
+        // Immediately clear previous drive/target data so stale items never stay visible
+        // while the newly selected target is being scanned.
+        self.tree = None;
+        self.tree_version = self.tree_version.wrapping_add(1);
+        self.expanded.clear();
+        self.selected_node = None;
+        self.selected_top_children.clear();
+        self.selected_full_path = None;
+        self.selected_has_fs_path = false;
+        self.treemap_root = None;
+        self.treemap_hovered = None;
+        self.visible_rows.clear();
+        self.top_file_rows.clear();
+        self.extension_rows.clear();
+        self.ext_filter = None;
+        self.denied_only_filter = false;
+        self.lock_status = FileLockStatus::NotChecked;
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_token = Some(cancel.clone());
@@ -676,6 +697,17 @@ impl Workspace {
     pub fn toggle_prefer_ntfs_mft(&mut self, cx: &mut Context<Self>) {
         self.settings.prefer_ntfs_mft = !self.settings.prefer_ntfs_mft;
         self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_always_run_as_admin(&mut self, cx: &mut Context<Self>) {
+        self.settings.always_run_as_admin = !self.settings.always_run_as_admin;
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub fn dismiss_admin_banner(&mut self, cx: &mut Context<Self>) {
+        self.dismissed_admin_banner = true;
         cx.notify();
     }
 
@@ -1248,6 +1280,7 @@ impl Workspace {
                         if self.is_elevated {
                             row.child(
                                 h_flex()
+                                    .id("hdr-admin-active")
                                     .px_1p5()
                                     .py_0p5()
                                     .gap_1()
@@ -1259,8 +1292,14 @@ impl Workspace {
                                     .text_xs()
                                     .font_medium()
                                     .text_color(solid(STATUS_SUCCESS))
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(
+                                            "Running as Administrator: direct NTFS MFT scans, protected system folders, and elevated file-lock inspection are active.",
+                                        )
+                                        .build(window, cx)
+                                    })
                                     .child(Icon::new(LucideIcon::ShieldCheck).xsmall())
-                                    .child("MFT"),
+                                    .child("Admin · MFT"),
                             )
                         } else {
                             row.child(
@@ -1279,6 +1318,12 @@ impl Workspace {
                                     .text_color(solid(accent.primary_hex()))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(soft_tint(accent.primary_hex(), 0.22)))
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(
+                                            "Relaunch as Administrator for instant NTFS MFT scans, protected system folder visibility, and elevated file-lock detection.",
+                                        )
+                                        .build(window, cx)
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.relaunch_as_admin(cx);
                                     }))
@@ -1410,10 +1455,10 @@ impl Workspace {
                         )
                     }),
             )
-            // Inline live scan banner or scan error banner
+            // Inline live scan banner (only when a tree is already visible)
             .when_some(
                 match &self.scan_state {
-                    ScanState::Scanning(p) => Some(p.clone()),
+                    ScanState::Scanning(p) if self.tree.is_some() => Some(p.clone()),
                     _ => None,
                 },
                 |pane, p| {
@@ -1510,6 +1555,109 @@ impl Workspace {
                     )
                 },
             )
+            // Contextual, dismissible Admin Mode benefit banner on Windows (non-elevated)
+            .when_some(
+                if cfg!(target_os = "windows")
+                    && !self.is_elevated
+                    && !self.dismissed_admin_banner
+                    && !matches!(self.scan_state, ScanState::Scanning(_))
+                {
+                    self.tree.as_ref().map(|t| t.root_node().denied_count)
+                } else {
+                    None
+                },
+                |pane, denied_count| {
+                    let has_denied = denied_count > 0;
+                    let banner_tint = if has_denied {
+                        STATUS_WARNING
+                    } else {
+                        accent.primary_hex()
+                    };
+                    let icon = if has_denied {
+                        LucideIcon::ShieldAlert
+                    } else {
+                        LucideIcon::Zap
+                    };
+                    let message = if has_denied {
+                        format!(
+                            "{} protected path(s) skipped. Admin Mode unlocks fast NTFS MFT, system folders & elevated lock detection.",
+                            format_count(u64::from(denied_count))
+                        )
+                    } else {
+                        "Admin Mode unlocks fast direct NTFS MFT scans, protected system folders & elevated file-lock detection."
+                            .to_string()
+                    };
+                    let cta = if has_denied {
+                        "Switch to Admin"
+                    } else {
+                        "Enable Admin"
+                    };
+
+                    pane.child(
+                        h_flex()
+                            .w_full()
+                            .min_h(px(34.))
+                            .px_3()
+                            .py_1()
+                            .gap_2p5()
+                            .items_center()
+                            .justify_between()
+                            .bg(soft_tint(banner_tint, if has_denied { 0.09 } else { 0.06 }))
+                            .border_b_1()
+                            .border_color(soft_tint(
+                                banner_tint,
+                                if has_denied { 0.28 } else { 0.20 },
+                            ))
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(icon)
+                                            .xsmall()
+                                            .text_color(solid(banner_tint)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(solid(TEXT_PRIMARY))
+                                            .child(SharedString::from(message)),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("banner-relaunch-admin")
+                                            .with_size(Size::XSmall)
+                                            .secondary()
+                                            .icon(LucideIcon::ShieldCheck)
+                                            .label(cta)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.relaunch_as_admin(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("banner-dismiss-admin")
+                                            .with_size(Size::XSmall)
+                                            .ghost()
+                                            .icon(IconName::Close)
+                                            .tooltip("Dismiss for this session")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.dismiss_admin_banner(cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
+            )
             // Active view (with optional split Treemap below) or calm empty state
             .child(div().flex_1().min_h_0().w_full().child(if self.tree.is_none() {
                 self.render_empty_state(cx).into_any_element()
@@ -1538,7 +1686,153 @@ impl Workspace {
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_scanning = matches!(self.scan_state, ScanState::Scanning(_));
+        let accent = self.settings.accent;
+        let unit = self.settings.size_unit;
+
+        if let ScanState::Scanning(p) = &self.scan_state {
+            let target_label = self.selected_target.display_label();
+            let engine_hint = if cfg!(target_os = "windows")
+                && self.is_elevated
+                && self.settings.prefer_ntfs_mft
+            {
+                "Reading direct NTFS Master File Table and building storage tree..."
+            } else {
+                "Indexing files and folders in parallel..."
+            };
+            let current_path = if p.current_path.is_empty() {
+                "Starting storage scan...".to_string()
+            } else {
+                p.current_path.clone()
+            };
+
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .px_6()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(520.))
+                        .items_center()
+                        .gap_3()
+                        .child(render_app_badge(44.))
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_center()
+                                        .truncate()
+                                        .text_base()
+                                        .font_semibold()
+                                        .text_color(solid(TEXT_PRIMARY))
+                                        .child(SharedString::from(format!(
+                                            "Scanning {target_label}..."
+                                        ))),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(solid(TEXT_MUTED))
+                                        .child(engine_hint),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(scan_metric_card(
+                                    "Files",
+                                    format_count(p.scanned_files),
+                                    TEXT_PRIMARY,
+                                ))
+                                .child(scan_metric_card(
+                                    "Folders",
+                                    format_count(p.scanned_dirs),
+                                    TEXT_PRIMARY,
+                                ))
+                                .child(scan_metric_card(
+                                    "Scanned",
+                                    format_size(p.scanned_bytes, unit),
+                                    accent.primary_hex(),
+                                )),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .px_3()
+                                .py_1p5()
+                                .gap_2()
+                                .items_center()
+                                .rounded(px(RADIUS_ROW))
+                                .bg(solid(BG_SURFACE))
+                                .border_1()
+                                .border_color(solid(BORDER_SUBTLE))
+                                .child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(6.))
+                                        .flex_shrink_0()
+                                        .rounded(px(999.))
+                                        .bg(solid(accent.primary_hex())),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(solid(TEXT_SECONDARY))
+                                        .child(SharedString::from(current_path)),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .text_color(solid(TEXT_MUTED))
+                                                .child(SharedString::from(format!(
+                                                    "Elapsed: {}",
+                                                    format_duration_ms(p.elapsed_ms)
+                                                ))),
+                                        )
+                                        .when(p.denied_count > 0, |row| {
+                                            row.child(
+                                                div()
+                                                    .text_color(solid(STATUS_WARNING))
+                                                    .child(SharedString::from(format!(
+                                                        "{} access denied",
+                                                        format_count(u64::from(p.denied_count))
+                                                    ))),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    Button::new("scanning-stop")
+                                        .with_size(Size::Small)
+                                        .danger()
+                                        .icon(LucideIcon::CircleStop)
+                                        .label("Stop Scan")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.stop_scan(cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
 
         v_flex()
             .size_full()
@@ -1555,51 +1849,69 @@ impl Workspace {
                             .text_sm()
                             .font_semibold()
                             .text_color(solid(TEXT_PRIMARY))
-                            .child(if is_scanning {
-                                "Scanning storage..."
-                            } else {
-                                "Analyze Disk Space"
-                            }),
+                            .child("Analyze Disk Space"),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(solid(TEXT_MUTED))
-                            .child(if is_scanning {
-                                "Building hierarchical size tree in parallel."
-                            } else {
-                                "Choose a drive from the sidebar, scan your entire PC, or pick a folder."
-                            }),
+                            .child(
+                                "Choose a drive from the sidebar, scan your entire PC, or pick a folder.",
+                            ),
                     ),
             )
-            .when(!is_scanning, |col| {
-                col.child(
-                    h_flex()
-                        .pt_1()
-                        .gap_2()
-                        .child(
-                            Button::new("empty-scan-all")
-                                .with_size(Size::Small)
-                                .primary()
-                                .icon(LucideIcon::Monitor)
-                                .label("Scan Entire PC")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.start_scan(ScanTarget::AllFixedDrives, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("empty-pick-folder")
-                                .with_size(Size::Small)
-                                .secondary()
-                                .icon(LucideIcon::FolderSearch)
-                                .label("Scan Folder...")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.pick_folder(window, cx);
-                                })),
-                        ),
-                )
-            })
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .child(
+                        Button::new("empty-scan-all")
+                            .with_size(Size::Small)
+                            .primary()
+                            .icon(LucideIcon::Monitor)
+                            .label("Scan Entire PC")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.start_scan(ScanTarget::AllFixedDrives, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("empty-pick-folder")
+                            .with_size(Size::Small)
+                            .secondary()
+                            .icon(LucideIcon::FolderSearch)
+                            .label("Scan Folder...")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_folder(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
+}
+
+fn scan_metric_card(label: &'static str, value: String, value_color: u32) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .px_3()
+        .py_2()
+        .gap_0p5()
+        .rounded(px(RADIUS_ROW))
+        .bg(solid(BG_SURFACE))
+        .border_1()
+        .border_color(solid(BORDER_SUBTLE))
+        .child(
+            div()
+                .text_xs()
+                .text_color(solid(TEXT_MUTED))
+                .child(label),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_semibold()
+                .text_color(solid(value_color))
+                .child(SharedString::from(value)),
+        )
 }
 
 fn subtab_btn(

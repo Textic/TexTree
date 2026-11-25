@@ -73,6 +73,15 @@ impl AssetSource for TexTreeAssets {
 fn main() {
     let initial_settings = AppSettings::load();
 
+    #[cfg(target_os = "windows")]
+    if initial_settings.always_run_as_admin
+        && !platform::is_elevated()
+        && !std::env::args().any(|arg| arg == "--no-auto-elevate")
+        && platform::relaunch_as_admin().is_ok()
+    {
+        return;
+    }
+
     gpui_kit::application()
         .with_assets(TexTreeAssets)
         .run(move |cx| {

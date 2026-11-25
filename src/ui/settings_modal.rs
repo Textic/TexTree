@@ -553,6 +553,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
     let auto_scan = ws.settings.auto_scan_on_launch;
     let show_treemap = ws.settings.show_treemap;
     let prefer_mft = ws.settings.prefer_ntfs_mft;
+    let always_admin = ws.settings.always_run_as_admin;
     let auto_check = ws.settings.auto_check_updates;
     let is_elevated = ws.is_elevated;
 
@@ -612,49 +613,68 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         )
         .when(cfg!(target_os = "windows"), |col| {
             col.child(
-                section_card("NTFS MFT Privileges").child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .child(
-                            v_flex()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .text_color(if is_elevated {
-                                            solid(STATUS_SUCCESS)
-                                        } else {
-                                            solid(TEXT_PRIMARY)
-                                        })
-                                        .child(if is_elevated {
-                                            "Running as Administrator — Fast NTFS MFT active"
-                                        } else {
-                                            "Running as Standard User — Parallel Win32 mode"
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(solid(TEXT_MUTED))
-                                        .child("Reading raw NTFS Master File Tables requires elevated Windows privileges."),
-                                ),
-                        )
-                        .when(!is_elevated, |row| {
-                            row.child(
-                                Button::new("set-relaunch-admin")
-                                    .with_size(Size::XSmall)
-                                    .primary()
-                                    .label("Relaunch as Admin")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.relaunch_as_admin(cx);
-                                    })),
+                section_card("Administrator Mode & Privileges")
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(if is_elevated {
+                                                solid(STATUS_SUCCESS)
+                                            } else {
+                                                solid(TEXT_PRIMARY)
+                                            })
+                                            .child(if is_elevated {
+                                                "Running as Administrator — Fast NTFS MFT & full access active"
+                                            } else {
+                                                "Running as Standard User — Parallel Win32 mode"
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(solid(TEXT_MUTED))
+                                            .child(
+                                                "Admin Mode unlocks instant direct NTFS MFT scans, protected system folders, and elevated file-lock inspection.",
+                                            ),
+                                    ),
                             )
-                        }),
-                ),
+                            .when(!is_elevated, |row| {
+                                row.child(
+                                    Button::new("set-relaunch-admin")
+                                        .with_size(Size::XSmall)
+                                        .primary()
+                                        .label("Relaunch as Admin")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.relaunch_as_admin(cx);
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .child(
+                                Checkbox::new("set-always-admin")
+                                    .checked(always_admin)
+                                    .label(
+                                        "Always request Administrator Mode on launch (shows Windows UAC prompt)",
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_always_run_as_admin(cx);
+                                    })),
+                            ),
+                    ),
             )
         })
 }
