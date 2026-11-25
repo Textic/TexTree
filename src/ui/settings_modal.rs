@@ -783,6 +783,8 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     }))
                                     .child(
                                         v_flex()
+                                            .w_full()
+                                            .min_w_0()
                                             .gap_0p5()
                                             .child(
                                                 h_flex()
@@ -792,6 +794,9 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     .gap_2()
                                                     .child(
                                                         h_flex()
+                                                            .min_w_0()
+                                                            .flex_1()
+                                                            .flex_wrap()
                                                             .items_center()
                                                             .gap_1p5()
                                                             .child(
@@ -804,6 +809,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                             .when_some(badge, |r, (lbl, col_hex)| {
                                                                 r.child(
                                                                     div()
+                                                                        .flex_shrink_0()
                                                                         .px_1p5()
                                                                         .py_0p5()
                                                                         .rounded(px(3.))
@@ -818,16 +824,19 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     )
                                                     .when(is_selected, |r| {
                                                         r.child(
-                                                            Icon::new(IconName::Check)
-                                                                .xsmall()
-                                                                .text_color(solid(
-                                                                    accent.primary_hex(),
-                                                                )),
+                                                            div().flex_shrink_0().child(
+                                                                Icon::new(IconName::Check)
+                                                                    .xsmall()
+                                                                    .text_color(solid(
+                                                                        accent.primary_hex(),
+                                                                    )),
+                                                            ),
                                                         )
                                                     }),
                                             )
                                             .child(
                                                 div()
+                                                    .w_full()
                                                     .text_xs()
                                                     .text_color(solid(TEXT_MUTED))
                                                     .child(mode.description()),
@@ -845,26 +854,35 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                             .bg(solid(BG_BASE))
                             .border_1()
                             .border_color(solid(BORDER_SUBTLE))
+                            .overflow_hidden()
                             .child(
                                 h_flex()
                                     .w_full()
-                                    .items_center()
+                                    .items_start()
                                     .justify_between()
                                     .gap_2()
                                     .child(
                                         h_flex()
-                                            .items_center()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .items_start()
                                             .gap_2()
                                             .child(
-                                                Icon::new(LucideIcon::ShieldCheck)
-                                                    .small()
-                                                    .text_color(solid(status_color)),
+                                                div().flex_shrink_0().pt_0p5().child(
+                                                    Icon::new(LucideIcon::ShieldCheck)
+                                                        .small()
+                                                        .text_color(solid(status_color)),
+                                                ),
                                             )
                                             .child(
                                                 v_flex()
+                                                    .min_w_0()
+                                                    .flex_1()
                                                     .gap_0p5()
                                                     .child(
                                                         h_flex()
+                                                            .w_full()
+                                                            .flex_wrap()
                                                             .items_center()
                                                             .gap_1p5()
                                                             .child(
@@ -876,6 +894,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                             )
                                                             .child(
                                                                 div()
+                                                                    .flex_shrink_0()
                                                                     .px_1p5()
                                                                     .py_0p5()
                                                                     .rounded(px(3.))
@@ -889,6 +908,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     )
                                                     .child(
                                                         div()
+                                                            .w_full()
                                                             .text_xs()
                                                             .text_color(solid(TEXT_MUTED))
                                                             .child(if has_service_bin {
@@ -900,14 +920,16 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                             ),
                                     )
                                     .child(
-                                        Button::new("set-svc-refresh")
-                                            .with_size(Size::XSmall)
-                                            .ghost()
-                                            .icon(IconName::RefreshCw)
-                                            .tooltip("Refresh Service Status")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.refresh_service_status(cx);
-                                            })),
+                                        div().flex_shrink_0().child(
+                                            Button::new("set-svc-refresh")
+                                                .with_size(Size::XSmall)
+                                                .ghost()
+                                                .icon(IconName::RefreshCw)
+                                                .tooltip("Refresh Service Status")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.refresh_service_status(cx);
+                                                })),
+                                        ),
                                     ),
                             )
                             .child(
@@ -986,24 +1008,28 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     .justify_between()
                                     .gap_3()
                                     .child(
-                                        Checkbox::new("set-always-admin")
-                                            .checked(always_admin)
-                                            .label(
-                                                "Always request Administrator Mode on launch (UAC mode only)",
-                                            )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_always_run_as_admin(cx);
-                                            })),
+                                        div().min_w_0().flex_1().child(
+                                            Checkbox::new("set-always-admin")
+                                                .checked(always_admin)
+                                                .label(
+                                                    "Always request Administrator Mode on launch (UAC mode only)",
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_always_run_as_admin(cx);
+                                                })),
+                                        ),
                                     )
                                     .when(!is_elevated, |row| {
                                         row.child(
-                                            Button::new("set-relaunch-admin")
-                                                .with_size(Size::XSmall)
-                                                .secondary()
-                                                .label("Relaunch as Admin")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.relaunch_as_admin(cx);
-                                                })),
+                                            div().flex_shrink_0().child(
+                                                Button::new("set-relaunch-admin")
+                                                    .with_size(Size::XSmall)
+                                                    .secondary()
+                                                    .label("Relaunch as Admin")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.relaunch_as_admin(cx);
+                                                    })),
+                                            ),
                                         )
                                     }),
                             ),
