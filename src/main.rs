@@ -48,6 +48,11 @@ impl AssetSource for TexTreeAssets {
         if path == "icons/textree.png" {
             return Ok(Some(Cow::Borrowed(include_bytes!("../assets/textree.png"))));
         }
+        if path == "icons/textree-64.png" {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/textree-64.png"
+            ))));
+        }
         if let Some(asset) = ExtraIcons.load(path)? {
             return Ok(Some(asset));
         }

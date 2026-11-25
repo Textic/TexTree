@@ -125,6 +125,7 @@ impl Workspace {
             }
         });
 
+        let auto_scan = settings.auto_scan_on_launch;
         let auto_check = settings.auto_check_updates;
         let mut ws = Self {
             focus_handle,
@@ -162,6 +163,9 @@ impl Workspace {
             _subscriptions: vec![search_sub],
         };
 
+        if auto_scan {
+            ws.start_scan(ScanTarget::AllFixedDrives, cx);
+        }
         if auto_check {
             ws.run_update_check(false, cx);
         }
@@ -607,6 +611,12 @@ impl Workspace {
 
     pub fn toggle_confirm_before_trash(&mut self, cx: &mut Context<Self>) {
         self.settings.confirm_before_trash = !self.settings.confirm_before_trash;
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_auto_scan_on_launch(&mut self, cx: &mut Context<Self>) {
+        self.settings.auto_scan_on_launch = !self.settings.auto_scan_on_launch;
         self.settings.save();
         cx.notify();
     }

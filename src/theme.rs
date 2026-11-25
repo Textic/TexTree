@@ -238,9 +238,15 @@ pub fn apply_obsidian_theme(accent: AccentPreset, cx: &mut App) {
     });
 }
 
-/// Renders the TexTree circular application emblem from embedded PNG assets.
+/// Renders the TexTree circular application emblem from embedded PNG assets,
+/// selecting the pre-filtered 64px asset at small UI sizes to prevent bilinear aliasing.
 pub fn render_app_badge(size_px: f32) -> impl IntoElement {
-    img("icons/textree.png")
+    let asset_path = if size_px <= 48.0 {
+        "icons/textree-64.png"
+    } else {
+        "icons/textree.png"
+    };
+    img(asset_path)
         .w(px(size_px))
         .h(px(size_px))
         .flex_shrink_0()

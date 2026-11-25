@@ -550,6 +550,7 @@ fn render_appearance_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl I
 fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let show_hidden = ws.settings.show_hidden_files;
     let confirm_trash = ws.settings.confirm_before_trash;
+    let auto_scan = ws.settings.auto_scan_on_launch;
     let auto_check = ws.settings.auto_check_updates;
 
     v_flex()
@@ -557,6 +558,14 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         .gap_3()
         .child(
             section_card("Behavior & Safety")
+                .child(
+                    Checkbox::new("set-auto-scan")
+                        .checked(auto_scan)
+                        .label("Automatically scan Entire PC on launch")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_auto_scan_on_launch(cx);
+                        })),
+                )
                 .child(
                     Checkbox::new("set-show-hidden")
                         .checked(show_hidden)
