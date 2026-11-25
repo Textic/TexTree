@@ -37,6 +37,7 @@ use crate::theme::{
     apply_obsidian_theme, crisp_resize_handle_appearance, format_count, format_duration_ms,
     format_size, full_hit_input, render_app_badge, soft_tint, solid,
 };
+use crate::ui::context_menu::{ContextMenuState, ContextMenuTarget, render_context_menu};
 use crate::ui::extensions_view::render_extensions_view;
 use crate::ui::files_view::render_files_view;
 use crate::ui::inspector::render_inspector;
@@ -152,6 +153,7 @@ pub struct Workspace {
     pub show_settings: bool,
     pub settings_category: SettingsCategory,
     pub pending_confirm: Option<PendingConfirm>,
+    pub context_menu: Option<ContextMenuState>,
     pub toast_message: Option<(String, bool)>,
     pub dismissed_admin_banner: bool,
     pub update_state: UpdateState,
@@ -221,6 +223,7 @@ impl Workspace {
             show_settings: false,
             settings_category: SettingsCategory::Appearance,
             pending_confirm: None,
+            context_menu: None,
             toast_message: None,
             dismissed_admin_banner: false,
             update_state: UpdateState::Idle,
@@ -703,6 +706,79 @@ impl Workspace {
         };
     }
 
+    pub fn open_node_context_menu(
+        &mut self,
+        node_id: NodeId,
+        from_treemap: bool,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_node(node_id, cx);
+        self.context_menu = Some(ContextMenuState {
+            position,
+            target: ContextMenuTarget::Node {
+                node_id,
+                from_treemap,
+            },
+        });
+        cx.notify();
+    }
+
+    pub fn open_volume_context_menu(
+        &mut self,
+        vol: VolumeInfo,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(ContextMenuState {
+            position,
+            target: ContextMenuTarget::Volume(vol),
+        });
+        cx.notify();
+    }
+
+    pub fn open_extension_context_menu(
+        &mut self,
+        ext: String,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(ContextMenuState {
+            position,
+            target: ContextMenuTarget::Extension(ext),
+        });
+        cx.notify();
+    }
+
+    pub fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn handle_treemap_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let hit_id = {
+            let cache = self.treemap_cache.borrow();
+            let lx = f32::from(position.x) - f32::from(cache.origin.x);
+            let ly = f32::from(position.y) - f32::from(cache.origin.y);
+            cache.layout.hit_test(lx, ly).map(|r| r.node_id)
+        }
+        .or(self.treemap_root)
+        .or_else(|| self.tree.as_ref().map(|t| t.root));
+
+        if let Some(node_id) = hit_id {
+            self.open_node_context_menu(node_id, true, position, cx);
+        }
+    }
+
+    pub fn reveal_path_in_explorer(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match platform::reveal_in_file_manager(path) {
+            Ok(()) => self.toast_message = None,
+            Err(err) => self.toast_message = Some((err, true)),
+        }
+        cx.notify();
+    }
+
     pub fn reveal_selected_in_explorer(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self
             .selected_node
@@ -710,10 +786,48 @@ impl Workspace {
         else {
             return;
         };
-        match platform::reveal_in_file_manager(&path) {
+        self.reveal_path_in_explorer(&path, cx);
+    }
+
+    pub fn open_terminal_for_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match platform::open_terminal_here(path) {
             Ok(()) => self.toast_message = None,
             Err(err) => self.toast_message = Some((err, true)),
         }
+        cx.notify();
+    }
+
+    pub fn open_terminal_for_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .selected_node
+            .and_then(|id| self.tree.as_ref()?.full_path(id))
+        else {
+            return;
+        };
+        self.open_terminal_for_path(&path, cx);
+    }
+
+    pub fn show_properties_for_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match platform::show_properties_dialog(path) {
+            Ok(()) => self.toast_message = None,
+            Err(err) => self.toast_message = Some((err, true)),
+        }
+        cx.notify();
+    }
+
+    pub fn show_properties_for_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .selected_node
+            .and_then(|id| self.tree.as_ref()?.full_path(id))
+        else {
+            return;
+        };
+        self.show_properties_for_path(&path, cx);
+    }
+
+    pub fn copy_text_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.toast_message = Some(("Copied to clipboard.".to_string(), false));
         cx.notify();
     }
 
@@ -731,33 +845,19 @@ impl Workspace {
     }
 
     pub fn request_trash_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(node_id) = self.selected_node else {
-            return;
-        };
-        let Some(tree) = &self.tree else {
-            return;
-        };
-        let Some(node) = tree.get(node_id) else {
-            return;
-        };
-        if node_id == tree.root
-            || node
-                .flags
-                .intersects(crate::models::NodeFlags::IS_VOLUME | crate::models::NodeFlags::IS_VIRTUAL)
-        {
-            return;
-        }
-        let Some(path) = tree.full_path(node_id) else {
+        let Some((node_id, name, path, size, is_dir, item_count)) =
+            self.selected_deletable_target()
+        else {
             return;
         };
 
         let pending = PendingConfirm::TrashItem {
             node_id,
-            name: node.name.to_string(),
+            name,
             path,
-            size: node.logical_size,
-            is_dir: node.is_container(),
-            item_count: node.total_items(),
+            size,
+            is_dir,
+            item_count,
         };
 
         if self.settings.confirm_before_trash {
@@ -769,6 +869,56 @@ impl Workspace {
         }
     }
 
+    pub fn request_permanent_delete_selected(&mut self, cx: &mut Context<Self>) {
+        let Some((node_id, name, path, size, is_dir, item_count)) =
+            self.selected_deletable_target()
+        else {
+            return;
+        };
+
+        let pending = PendingConfirm::PermanentDelete {
+            node_id,
+            name,
+            path,
+            size,
+            is_dir,
+            item_count,
+            dont_ask_again: false,
+        };
+
+        if self.settings.confirm_before_permanent_delete {
+            self.pending_confirm = Some(pending);
+            cx.notify();
+        } else {
+            self.pending_confirm = Some(pending);
+            self.accept_confirm(cx);
+        }
+    }
+
+    fn selected_deletable_target(
+        &self,
+    ) -> Option<(NodeId, String, PathBuf, u64, bool, u64)> {
+        let node_id = self.selected_node?;
+        let tree = self.tree.as_ref()?;
+        let node = tree.get(node_id)?;
+        if node_id == tree.root
+            || node
+                .flags
+                .intersects(crate::models::NodeFlags::IS_VOLUME | crate::models::NodeFlags::IS_VIRTUAL)
+        {
+            return None;
+        }
+        let path = tree.full_path(node_id)?;
+        Some((
+            node_id,
+            node.name.to_string(),
+            path,
+            node.logical_size,
+            node.is_container(),
+            node.total_items(),
+        ))
+    }
+
     pub fn dismiss_confirm(&mut self, cx: &mut Context<Self>) {
         self.pending_confirm = None;
         cx.notify();
@@ -777,6 +927,15 @@ impl Workspace {
     pub fn toggle_admin_prompt_persist(&mut self, cx: &mut Context<Self>) {
         if let Some(PendingConfirm::AdminMode { persist }) = &mut self.pending_confirm {
             *persist = !*persist;
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_perm_delete_dont_ask(&mut self, cx: &mut Context<Self>) {
+        if let Some(PendingConfirm::PermanentDelete { dont_ask_again, .. }) =
+            &mut self.pending_confirm
+        {
+            *dont_ask_again = !*dont_ask_again;
             cx.notify();
         }
     }
@@ -811,65 +970,94 @@ impl Workspace {
                 path,
                 ..
             } => {
-                let trash_path = path.clone();
-                let (tx, mut rx) = unbounded::<Result<(), String>>();
-                std::thread::spawn(move || {
-                    let res = platform::move_to_trash(&path);
-                    let _ = tx.unbounded_send(res);
-                });
-
-                cx.spawn(async move |this, cx| {
-                    if let Some(res) = rx.next().await {
-                        let _ = this.update(cx, |this, cx| match res {
-                            Ok(()) => {
-                                let parent_id = this
-                                    .tree
-                                    .as_ref()
-                                    .and_then(|t| t.get(node_id))
-                                    .and_then(|n| n.parent);
-                                if let Some(tree) = &mut this.tree {
-                                    Arc::make_mut(tree).remove_subtree_soft(node_id);
-                                    this.tree_version = this.tree_version.wrapping_add(1);
-                                }
-                                let current_key = ScanCacheKey::from_target(&this.selected_target);
-                                if let Some(tree) = this.tree.clone()
-                                    && let Some(entry) = this.scan_cache.get_mut(&current_key)
-                                {
-                                    entry.tree = tree;
-                                }
-                                for (k, entry) in this.scan_cache.iter_mut() {
-                                    if *k == current_key {
-                                        continue;
-                                    }
-                                    if let Some(other_id) =
-                                        entry.tree.find_node_by_path(&trash_path)
-                                    {
-                                        Arc::make_mut(&mut entry.tree)
-                                            .remove_subtree_soft(other_id);
-                                    }
-                                }
-                                this.selected_node = parent_id;
-                                this.treemap_hovered = None;
-                                this.list_hovered = None;
-                                this.lock_status = FileLockStatus::NotApplicable;
-                                this.refresh_selection_cache();
-                                this.rebuild_cached_views();
-                                this.volumes = platform::list_volumes();
-                                this.toast_message =
-                                    Some((format!("Moved \"{name}\" to Recycle Bin."), false));
-                                cx.notify();
-                            }
-                            Err(err) => {
-                                this.toast_message = Some((err, true));
-                                cx.notify();
-                            }
-                        });
-                    }
-                })
-                .detach();
-                cx.notify();
+                self.spawn_remove_item(node_id, name, path, false, cx);
+            }
+            PendingConfirm::PermanentDelete {
+                node_id,
+                name,
+                path,
+                dont_ask_again,
+                ..
+            } => {
+                if dont_ask_again {
+                    self.settings.confirm_before_permanent_delete = false;
+                    self.settings.save();
+                }
+                self.spawn_remove_item(node_id, name, path, true, cx);
             }
         }
+    }
+
+    fn spawn_remove_item(
+        &mut self,
+        node_id: NodeId,
+        name: String,
+        path: PathBuf,
+        permanent: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let removed_path = path.clone();
+        let (tx, mut rx) = unbounded::<Result<(), String>>();
+        std::thread::spawn(move || {
+            let res = if permanent {
+                platform::delete_permanently(&path)
+            } else {
+                platform::move_to_trash(&path)
+            };
+            let _ = tx.unbounded_send(res);
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Some(res) = rx.next().await {
+                let _ = this.update(cx, |this, cx| match res {
+                    Ok(()) => {
+                        let parent_id = this
+                            .tree
+                            .as_ref()
+                            .and_then(|t| t.get(node_id))
+                            .and_then(|n| n.parent);
+                        if let Some(tree) = &mut this.tree {
+                            Arc::make_mut(tree).remove_subtree_soft(node_id);
+                            this.tree_version = this.tree_version.wrapping_add(1);
+                        }
+                        let current_key = ScanCacheKey::from_target(&this.selected_target);
+                        if let Some(tree) = this.tree.clone()
+                            && let Some(entry) = this.scan_cache.get_mut(&current_key)
+                        {
+                            entry.tree = tree;
+                        }
+                        for (k, entry) in this.scan_cache.iter_mut() {
+                            if *k == current_key {
+                                continue;
+                            }
+                            if let Some(other_id) = entry.tree.find_node_by_path(&removed_path) {
+                                Arc::make_mut(&mut entry.tree).remove_subtree_soft(other_id);
+                            }
+                        }
+                        this.selected_node = parent_id;
+                        this.treemap_hovered = None;
+                        this.list_hovered = None;
+                        this.lock_status = FileLockStatus::NotApplicable;
+                        this.refresh_selection_cache();
+                        this.rebuild_cached_views();
+                        this.volumes = platform::list_volumes();
+                        let msg = if permanent {
+                            format!("Permanently deleted \"{name}\".")
+                        } else {
+                            format!("Moved \"{name}\" to Recycle Bin.")
+                        };
+                        this.toast_message = Some((msg, false));
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        this.toast_message = Some((err, true));
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     // --- Settings mutators ---
@@ -896,6 +1084,13 @@ impl Workspace {
 
     pub fn toggle_confirm_before_trash(&mut self, cx: &mut Context<Self>) {
         self.settings.confirm_before_trash = !self.settings.confirm_before_trash;
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_confirm_before_permanent_delete(&mut self, cx: &mut Context<Self>) {
+        self.settings.confirm_before_permanent_delete =
+            !self.settings.confirm_before_permanent_delete;
         self.settings.save();
         cx.notify();
     }
@@ -1342,7 +1537,7 @@ impl Workspace {
     }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_settings || self.pending_confirm.is_some() {
+        if self.show_settings || self.pending_confirm.is_some() || self.context_menu.is_some() {
             return;
         }
         let key = event.keystroke.key.as_str();
@@ -1416,7 +1611,14 @@ impl Workspace {
                     .scroll_to_item(prev_idx, ScrollStrategy::Nearest);
             }
             (_, "delete") => {
-                self.request_trash_selected(cx);
+                if event.keystroke.modifiers.shift {
+                    self.request_permanent_delete_selected(cx);
+                } else {
+                    self.request_trash_selected(cx);
+                }
+            }
+            (_, "backspace") => {
+                self.treemap_zoom_up(cx);
             }
             _ => {}
         }
@@ -2496,7 +2698,9 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &CancelOrDismiss, window, cx| {
-                if this.pending_confirm.is_some() {
+                if this.context_menu.is_some() {
+                    this.dismiss_context_menu(cx);
+                } else if this.pending_confirm.is_some() {
                     this.dismiss_confirm(cx);
                 } else if this.show_settings {
                     this.show_settings = false;
@@ -2527,6 +2731,9 @@ impl Render for Workspace {
             }))
             .child(self.render_header(window, cx))
             .child(div().flex_1().min_h_0().w_full().child(body))
+            .when_some(self.context_menu.as_ref(), |root, menu| {
+                root.child(render_context_menu(self, menu, window, cx))
+            })
             .when(self.show_settings, |root| {
                 root.child(render_settings_modal(self, cx))
             })

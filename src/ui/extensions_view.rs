@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui_kit::{
-    Context, SharedString,
+    Context, MouseButton, MouseDownEvent, SharedString,
     component::{StyledExt as _, h_flex, v_flex},
     div, prelude::*, px, relative, uniform_list,
 };
@@ -120,6 +120,7 @@ fn render_extension_rows(
                 (stat.total_size as f64 / total_scan_bytes as f64).clamp(0.0, 1.0) as f32
             };
             let ext_for_click = stat.extension.clone();
+            let ext_for_ctx = stat.extension.clone();
             let row_bg = if ix % 2 == 1 {
                 solid(BG_SURFACE)
             } else {
@@ -138,6 +139,13 @@ fn render_extension_rows(
                     .border_color(solid(BORDER_SUBTLE))
                     .hover(|s| s.bg(solid(BG_HOVER)))
                     .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, evt: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_extension_context_menu(ext_for_ctx.clone(), evt.position, cx);
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.filter_by_extension(ext_for_click.clone(), cx);
                     }))

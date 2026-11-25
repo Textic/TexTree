@@ -1,3 +1,4 @@
+pub mod context_menu;
 pub mod extensions_view;
 pub mod files_view;
 pub mod inspector;

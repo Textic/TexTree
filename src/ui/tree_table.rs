@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui_kit::{
-    Context, SharedString,
+    Context, MouseButton, MouseDownEvent, SharedString,
     assets::IconName as LucideIcon,
     component::{Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex},
     div, prelude::*, px, relative, uniform_list,
@@ -330,6 +330,13 @@ fn render_tree_rows(
                             this.clear_list_hovered(Some(node_id), cx);
                         }
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, evt: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_node_context_menu(node_id, false, evt.position, cx);
+                        }),
+                    )
                     .on_click(cx.listener(move |this, evt: &gpui_kit::ClickEvent, _, cx| {
                         this.select_node(node_id, cx);
                         if evt.click_count() >= 2 && has_children {

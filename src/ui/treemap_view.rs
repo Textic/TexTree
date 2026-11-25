@@ -148,7 +148,7 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                     .with_size(Size::XSmall)
                                     .ghost()
                                     .icon(IconName::ArrowUp)
-                                    .tooltip("Zoom Out One Level (Right-Click)")
+                                    .tooltip("Zoom Out One Level (Backspace)")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.treemap_zoom_up(cx);
                                     })),
@@ -279,8 +279,9 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, _, _, cx| {
-                        this.treemap_zoom_up(cx);
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.handle_treemap_context_menu(event.position, cx);
                     }),
                 )
                 .child(

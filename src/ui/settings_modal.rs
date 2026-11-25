@@ -60,6 +60,15 @@ pub enum PendingConfirm {
         is_dir: bool,
         item_count: u64,
     },
+    PermanentDelete {
+        node_id: NodeId,
+        name: String,
+        path: std::path::PathBuf,
+        size: u64,
+        is_dir: bool,
+        item_count: u64,
+        dont_ask_again: bool,
+    },
     AdminMode {
         persist: bool,
     },
@@ -156,6 +165,111 @@ pub fn render_confirm_modal(
                                     .danger()
                                     .icon(IconName::Delete)
                                     .label("Move to Trash")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.accept_confirm(cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+                cx,
+            )
+        }
+        PendingConfirm::PermanentDelete {
+            name,
+            path,
+            size,
+            is_dir,
+            item_count,
+            dont_ask_again,
+            ..
+        } => {
+            let dont_ask_again = *dont_ask_again;
+            let summary = if *is_dir {
+                format!(
+                    "Permanently delete folder \"{name}\" ({}, {} items)?",
+                    format_size(*size, unit),
+                    format_count(*item_count)
+                )
+            } else {
+                format!(
+                    "Permanently delete file \"{name}\" ({})?",
+                    format_size(*size, unit)
+                )
+            };
+
+            render_confirm_shell(
+                "Delete Permanently",
+                Some((LucideIcon::ShieldAlert, STATUS_ERROR)),
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(solid(TEXT_PRIMARY))
+                            .child(SharedString::from(summary)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .p_2()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(solid(BG_BASE))
+                            .border_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .text_xs()
+                            .text_color(solid(TEXT_SECONDARY))
+                            .child(SharedString::from(path.to_string_lossy().into_owned())),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_1p5()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(soft_tint(STATUS_ERROR, 0.08))
+                            .border_1()
+                            .border_color(soft_tint(STATUS_ERROR, 0.28))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(STATUS_ERROR))
+                                    .child(
+                                        "This bypasses the Recycle Bin and cannot be undone.",
+                                    ),
+                            )
+                            .child(
+                                Checkbox::new("confirm-perm-del-dont-ask")
+                                    .checked(dont_ask_again)
+                                    .label("Don't ask me again for permanent deletion")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_perm_delete_dont_ask(cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .pt_1()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("confirm-perm-del-cancel")
+                                    .with_size(Size::Small)
+                                    .secondary()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_confirm(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-perm-del-accept")
+                                    .with_size(Size::Small)
+                                    .danger()
+                                    .icon(IconName::Delete)
+                                    .label("Delete Permanently")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.accept_confirm(cx);
                                     })),
@@ -711,6 +825,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
     let accent = ws.settings.accent;
     let show_hidden = ws.settings.show_hidden_files;
     let confirm_trash = ws.settings.confirm_before_trash;
+    let confirm_perm_del = ws.settings.confirm_before_permanent_delete;
     let auto_scan = ws.settings.auto_scan_on_launch;
     let show_treemap = ws.settings.show_treemap;
     let prefer_mft = ws.settings.prefer_ntfs_mft;
@@ -1076,6 +1191,14 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                         .label("Ask for confirmation before moving items to the Recycle Bin")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_confirm_before_trash(cx);
+                        })),
+                )
+                .child(
+                    Checkbox::new("set-confirm-perm-del")
+                        .checked(confirm_perm_del)
+                        .label("Ask for confirmation before permanently deleting items (Shift+Del)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_confirm_before_permanent_delete(cx);
                         })),
                 )
                 .child(

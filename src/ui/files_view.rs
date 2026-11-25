@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui_kit::{
-    Context, SharedString,
+    Context, MouseButton, MouseDownEvent, SharedString,
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -267,6 +267,13 @@ fn render_file_rows(
                             this.clear_list_hovered(Some(node_id), cx);
                         }
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, evt: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_node_context_menu(node_id, false, evt.position, cx);
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_node(node_id, cx);
                     }))
