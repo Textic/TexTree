@@ -740,18 +740,21 @@ pub fn spawn_detached_updater(staged: &StagedUpdate) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
+const WIN_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const WIN_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+#[cfg(target_os = "windows")]
 fn spawn_windows_updater(staged: &StagedUpdate) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-
     let script_path = staged.stage_dir.join("apply-update.ps1");
     let log_path = updates_root_dir().join("last-update.log");
-    let install_dir = staged
+    let install_dir_path = staged
         .target_exe
         .parent()
-        .ok_or_else(|| "Current executable has no parent directory.".to_string())?
+        .ok_or_else(|| "Current executable has no parent directory.".to_string())?;
+    let install_dir = install_dir_path
         .to_string_lossy()
         .trim_end_matches(['\\', '/'])
         .to_string();
@@ -762,6 +765,19 @@ fn spawn_windows_updater(staged: &StagedUpdate) -> Result<(), String> {
         _ => return Err("Unsupported Windows self-update mode.".to_string()),
     };
 
+    let dir_writable = is_dir_writable(install_dir_path);
+    let is_program_files = install_dir.to_ascii_lowercase().contains("\\program files");
+    let all_users = if !dir_writable || is_program_files {
+        "1"
+    } else {
+        "0"
+    };
+    let needs_elevation = if !dir_writable && !crate::platform::is_elevated() {
+        "1"
+    } else {
+        "0"
+    };
+
     let ps1 = r#"$ErrorActionPreference = 'Stop'
 $pidToWait = [int]$env:TEXTREE_PID
 $targetExe = $env:TEXTREE_TARGET_EXE
@@ -769,6 +785,8 @@ $sourceFile = $env:TEXTREE_SOURCE_FILE
 $installDir = $env:TEXTREE_INSTALL_DIR
 $stageDir = $env:TEXTREE_STAGE_DIR
 $mode = $env:TEXTREE_MODE
+$allUsers = $env:TEXTREE_ALL_USERS
+$needsElevation = $env:TEXTREE_NEEDS_ELEVATION
 $logFile = $env:TEXTREE_LOG_FILE
 
 try {
@@ -781,8 +799,13 @@ try {
     Start-Sleep -Milliseconds 300
 
     if ($mode -eq 'setup') {
-        $dirArg = '/DIR="' + $installDir + '"'
-        $proc = Start-Process -FilePath $sourceFile -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', $dirArg) -Wait -PassThru
+        $scopeArg = if ($allUsers -eq '1') { '/ALLUSERS' } else { '/CURRENTUSER' }
+        $argsLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- ' + $scopeArg + ' /DIR="' + $installDir + '"'
+        if ($needsElevation -eq '1') {
+            $proc = Start-Process -FilePath $sourceFile -Verb RunAs -ArgumentList $argsLine -Wait -PassThru
+        } else {
+            $proc = Start-Process -FilePath $sourceFile -ArgumentList $argsLine -Wait -PassThru
+        }
         if ($proc.ExitCode -ne 0) {
             throw "Installer exited with code $($proc.ExitCode)"
         }
@@ -820,6 +843,8 @@ try {
     fs::write(&script_path, ps1)
         .map_err(|e| format!("Failed to write update helper script: {e}"))?;
 
+    // IMPORTANT: Never combine CREATE_NO_WINDOW with DETACHED_PROCESS — on Windows
+    // that combination causes powershell.exe to exit immediately without executing the script.
     Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -837,11 +862,13 @@ try {
         .env("TEXTREE_INSTALL_DIR", install_dir)
         .env("TEXTREE_STAGE_DIR", &staged.stage_dir)
         .env("TEXTREE_MODE", mode)
+        .env("TEXTREE_ALL_USERS", all_users)
+        .env("TEXTREE_NEEDS_ELEVATION", needs_elevation)
         .env("TEXTREE_LOG_FILE", log_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .creation_flags(WIN_CREATE_NO_WINDOW | WIN_CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .map_err(|e| format!("Failed to launch background updater: {e}"))?;
 
@@ -1132,5 +1159,42 @@ mod tests {
             parse_sha256_for_asset(sums, "textree-v0.1.1-linux-x86_64.deb"),
             None
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hidden_powershell_executes_script_with_valid_creation_flags() {
+        use std::os::windows::process::CommandExt;
+
+        let dir = std::env::temp_dir().join(format!("textree_ps_flag_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let script = dir.join("probe.ps1");
+        let marker = dir.join("ok.txt");
+        fs::write(&script, "Set-Content -LiteralPath $env:TEXTREE_PROBE_OUT -Value 'ran'").unwrap();
+
+        let status = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+            ])
+            .arg(&script)
+            .env("TEXTREE_PROBE_OUT", &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(WIN_CREATE_NO_WINDOW | WIN_CREATE_NEW_PROCESS_GROUP)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "ran");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
