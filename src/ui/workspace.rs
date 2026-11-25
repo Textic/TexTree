@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures_channel::mpsc::unbounded;
 use futures_util::StreamExt as _;
 use gpui_kit::{
-    ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, PathPromptOptions,
-    Pixels, Point, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
-    WindowControlArea,
+    ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseMoveEvent,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Subscription,
+    UniformListScrollHandle, Window, WindowControlArea,
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -603,55 +603,83 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn toggle_admin_prompt_persist(&mut self, cx: &mut Context<Self>) {
+        if let Some(PendingConfirm::AdminMode { persist }) = &mut self.pending_confirm {
+            *persist = !*persist;
+            cx.notify();
+        }
+    }
+
     pub fn accept_confirm(&mut self, cx: &mut Context<Self>) {
         let Some(action) = self.pending_confirm.take() else {
             return;
         };
-        let PendingConfirm::TrashItem {
-            node_id,
-            name,
-            path,
-            ..
-        } = action;
-
-        let (tx, mut rx) = unbounded::<Result<(), String>>();
-        std::thread::spawn(move || {
-            let res = platform::move_to_trash(&path);
-            let _ = tx.unbounded_send(res);
-        });
-
-        cx.spawn(async move |this, cx| {
-            if let Some(res) = rx.next().await {
-                let _ = this.update(cx, |this, cx| match res {
+        match action {
+            PendingConfirm::AdminMode { persist } => {
+                let prev_always = self.settings.always_run_as_admin;
+                let prev_shown = self.settings.admin_prompt_shown;
+                self.settings.always_run_as_admin = persist;
+                self.settings.admin_prompt_shown = true;
+                self.settings.save();
+                match platform::relaunch_as_admin() {
                     Ok(()) => {
-                        let parent_id = this
-                            .tree
-                            .as_ref()
-                            .and_then(|t| t.get(node_id))
-                            .and_then(|n| n.parent);
-                        if let Some(tree) = &mut this.tree {
-                            Arc::make_mut(tree).remove_subtree_soft(node_id);
-                            this.tree_version = this.tree_version.wrapping_add(1);
-                        }
-                        this.selected_node = parent_id;
-                        this.treemap_hovered = None;
-                        this.lock_status = FileLockStatus::NotApplicable;
-                        this.refresh_selection_cache();
-                        this.rebuild_cached_views();
-                        this.volumes = platform::list_volumes();
-                        this.toast_message =
-                            Some((format!("Moved \"{name}\" to Recycle Bin."), false));
-                        cx.notify();
+                        cx.quit();
                     }
                     Err(err) => {
-                        this.toast_message = Some((err, true));
+                        self.settings.always_run_as_admin = prev_always;
+                        self.settings.admin_prompt_shown = prev_shown;
+                        self.settings.save();
+                        self.toast_message = Some((err, true));
                         cx.notify();
                     }
-                });
+                }
             }
-        })
-        .detach();
-        cx.notify();
+            PendingConfirm::TrashItem {
+                node_id,
+                name,
+                path,
+                ..
+            } => {
+                let (tx, mut rx) = unbounded::<Result<(), String>>();
+                std::thread::spawn(move || {
+                    let res = platform::move_to_trash(&path);
+                    let _ = tx.unbounded_send(res);
+                });
+
+                cx.spawn(async move |this, cx| {
+                    if let Some(res) = rx.next().await {
+                        let _ = this.update(cx, |this, cx| match res {
+                            Ok(()) => {
+                                let parent_id = this
+                                    .tree
+                                    .as_ref()
+                                    .and_then(|t| t.get(node_id))
+                                    .and_then(|n| n.parent);
+                                if let Some(tree) = &mut this.tree {
+                                    Arc::make_mut(tree).remove_subtree_soft(node_id);
+                                    this.tree_version = this.tree_version.wrapping_add(1);
+                                }
+                                this.selected_node = parent_id;
+                                this.treemap_hovered = None;
+                                this.lock_status = FileLockStatus::NotApplicable;
+                                this.refresh_selection_cache();
+                                this.rebuild_cached_views();
+                                this.volumes = platform::list_volumes();
+                                this.toast_message =
+                                    Some((format!("Moved \"{name}\" to Recycle Bin."), false));
+                                cx.notify();
+                            }
+                            Err(err) => {
+                                this.toast_message = Some((err, true));
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .detach();
+                cx.notify();
+            }
+        }
     }
 
     // --- Settings mutators ---
@@ -690,6 +718,9 @@ impl Workspace {
 
     pub fn toggle_treemap(&mut self, cx: &mut Context<Self>) {
         self.settings.show_treemap = !self.settings.show_treemap;
+        if !self.settings.show_treemap {
+            self.treemap_hovered = None;
+        }
         self.settings.save();
         cx.notify();
     }
@@ -702,6 +733,7 @@ impl Workspace {
 
     pub fn toggle_always_run_as_admin(&mut self, cx: &mut Context<Self>) {
         self.settings.always_run_as_admin = !self.settings.always_run_as_admin;
+        self.settings.admin_prompt_shown = true;
         self.settings.save();
         cx.notify();
     }
@@ -712,6 +744,17 @@ impl Workspace {
     }
 
     pub fn relaunch_as_admin(&mut self, cx: &mut Context<Self>) {
+        if self.is_elevated {
+            return;
+        }
+        if cfg!(target_os = "windows")
+            && !self.settings.admin_prompt_shown
+            && !self.settings.always_run_as_admin
+        {
+            self.pending_confirm = Some(PendingConfirm::AdminMode { persist: true });
+            cx.notify();
+            return;
+        }
         match platform::relaunch_as_admin() {
             Ok(()) => {
                 self.settings.save();
@@ -749,12 +792,33 @@ impl Workspace {
         }
     }
 
+    pub fn clear_treemap_hover(&mut self, cx: &mut Context<Self>) {
+        if self.treemap_hovered.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn sync_treemap_hover_bounds(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.treemap_hovered.is_none() {
+            return;
+        }
+        let inside = self.treemap_cache.borrow().bounds.contains(&position);
+        if !inside {
+            self.treemap_hovered = None;
+            cx.notify();
+        }
+    }
+
     pub fn handle_treemap_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let hit = {
             let cache = self.treemap_cache.borrow();
-            let lx = f32::from(position.x) - f32::from(cache.origin.x);
-            let ly = f32::from(position.y) - f32::from(cache.origin.y);
-            cache.layout.hit_test(lx, ly).map(|r| r.node_id)
+            if !cache.bounds.contains(&position) {
+                None
+            } else {
+                let lx = f32::from(position.x) - f32::from(cache.origin.x);
+                let ly = f32::from(position.y) - f32::from(cache.origin.y);
+                cache.layout.hit_test(lx, ly).map(|r| r.node_id)
+            }
         };
         if self.treemap_hovered != hit {
             self.treemap_hovered = hit;
@@ -2060,6 +2124,14 @@ impl Render for Workspace {
             .flex_col()
             .bg(solid(BG_BASE))
             .text_color(solid(TEXT_PRIMARY))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.clear_treemap_hover(cx);
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.sync_treemap_hover_bounds(event.position, cx);
+            }))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.search_input.update(cx, |s, cx| s.focus(window, cx));
@@ -2108,7 +2180,12 @@ impl Render for Workspace {
                 root.child(render_settings_modal(self, cx))
             })
             .when_some(self.pending_confirm.as_ref(), |root, action| {
-                root.child(render_confirm_modal(action, self.settings.size_unit, cx))
+                root.child(render_confirm_modal(
+                    action,
+                    self.settings.accent,
+                    self.settings.size_unit,
+                    cx,
+                ))
             })
     }
 }

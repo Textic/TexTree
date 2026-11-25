@@ -35,6 +35,7 @@ pub struct TreemapCanvasCache {
     pub root_id: NodeId,
     pub show_hidden: bool,
     pub size_unit: SizeUnit,
+    pub bounds: Bounds<Pixels>,
     pub origin: Point<Pixels>,
     pub width: f32,
     pub height: f32,
@@ -255,6 +256,11 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 .w_full()
                 .bg(solid(BG_BASE))
                 .cursor_pointer()
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if !*hovered {
+                        this.clear_treemap_hover(cx);
+                    }
+                }))
                 .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                     this.handle_treemap_hover(event.position, cx);
                 }))
@@ -276,6 +282,7 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                             let w = f32::from(bounds.size.width).max(0.0);
                             let h = f32::from(bounds.size.height).max(0.0);
                             let mut cache = cache_for_canvas.borrow_mut();
+                            cache.bounds = bounds;
                             cache.origin = bounds.origin;
                             let needs_recompute = cache.tree_version != tree_version
                                 || cache.root_id != treemap_root

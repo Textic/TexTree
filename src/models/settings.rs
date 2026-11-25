@@ -99,6 +99,8 @@ pub struct AppSettings {
     pub prefer_ntfs_mft: bool,
     #[serde(default)]
     pub always_run_as_admin: bool,
+    #[serde(default)]
+    pub admin_prompt_shown: bool,
     #[serde(default = "default_true")]
     pub show_treemap: bool,
     #[serde(default = "default_true")]
@@ -119,6 +121,7 @@ impl Default for AppSettings {
             auto_scan_on_launch: true,
             prefer_ntfs_mft: true,
             always_run_as_admin: false,
+            admin_prompt_shown: false,
             show_treemap: true,
             auto_check_updates: true,
         }
@@ -166,6 +169,7 @@ mod tests {
         assert!(defaults.auto_scan_on_launch);
         assert!(defaults.prefer_ntfs_mft);
         assert!(!defaults.always_run_as_admin);
+        assert!(!defaults.admin_prompt_shown);
         assert!(defaults.show_treemap);
         assert!(defaults.auto_check_updates);
 
@@ -177,6 +181,7 @@ mod tests {
             auto_scan_on_launch: false,
             prefer_ntfs_mft: false,
             always_run_as_admin: true,
+            admin_prompt_shown: true,
             show_treemap: false,
             auto_check_updates: false,
         };
@@ -188,11 +193,13 @@ mod tests {
         assert!(!parsed.auto_scan_on_launch);
         assert!(!parsed.prefer_ntfs_mft);
         assert!(parsed.always_run_as_admin);
+        assert!(parsed.admin_prompt_shown);
         assert!(!parsed.show_treemap);
         assert!(!parsed.auto_check_updates);
 
-        // Legacy settings JSON without `always_run_as_admin` must deserialize safely.
+        // Legacy settings JSON without newer admin flags must deserialize safely.
         let legacy: AppSettings = serde_json::from_str(r#"{"accent":"Emerald"}"#).unwrap();
         assert!(!legacy.always_run_as_admin);
+        assert!(!legacy.admin_prompt_shown);
     }
 }

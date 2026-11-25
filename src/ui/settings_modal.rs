@@ -1,5 +1,6 @@
 use gpui_kit::{
     Context, SharedString,
+    assets::IconName as LucideIcon,
     component::{
         Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
         button::{Button, ButtonVariants as _},
@@ -58,6 +59,9 @@ pub enum PendingConfirm {
         is_dir: bool,
         item_count: u64,
     },
+    AdminMode {
+        persist: bool,
+    },
 }
 
 fn modal_backdrop(id: &'static str) -> gpui_kit::Stateful<gpui_kit::Div> {
@@ -71,31 +75,219 @@ fn modal_backdrop(id: &'static str) -> gpui_kit::Stateful<gpui_kit::Div> {
 
 pub fn render_confirm_modal(
     action: &PendingConfirm,
+    accent: AccentPreset,
     unit: SizeUnit,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let PendingConfirm::TrashItem {
-        name,
-        path,
-        size,
-        is_dir,
-        item_count,
-        ..
-    } = action;
+    match action {
+        PendingConfirm::TrashItem {
+            name,
+            path,
+            size,
+            is_dir,
+            item_count,
+            ..
+        } => {
+            let summary = if *is_dir {
+                format!(
+                    "Move folder \"{name}\" ({}, {} items) to the Recycle Bin?",
+                    format_size(*size, unit),
+                    format_count(*item_count)
+                )
+            } else {
+                format!(
+                    "Move file \"{name}\" ({}) to the Recycle Bin?",
+                    format_size(*size, unit)
+                )
+            };
 
-    let summary = if *is_dir {
-        format!(
-            "Move folder \"{name}\" ({}, {} items) to the Recycle Bin?",
-            format_size(*size, unit),
-            format_count(*item_count)
-        )
-    } else {
-        format!(
-            "Move file \"{name}\" ({}) to the Recycle Bin?",
-            format_size(*size, unit)
-        )
-    };
+            render_confirm_shell(
+                "Move to Recycle Bin",
+                None,
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(solid(TEXT_PRIMARY))
+                            .child(SharedString::from(summary)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .p_2()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(solid(BG_BASE))
+                            .border_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .text_xs()
+                            .text_color(solid(TEXT_SECONDARY))
+                            .child(SharedString::from(path.to_string_lossy().into_owned())),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(solid(TEXT_MUTED))
+                            .child(
+                                "Items moved to the Recycle Bin can be restored from your operating system.",
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .pt_1()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("confirm-dialog-cancel")
+                                    .with_size(Size::Small)
+                                    .secondary()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_confirm(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-dialog-accept")
+                                    .with_size(Size::Small)
+                                    .danger()
+                                    .icon(IconName::Delete)
+                                    .label("Move to Trash")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.accept_confirm(cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+                cx,
+            )
+        }
+        PendingConfirm::AdminMode { persist } => {
+            let persist = *persist;
+            let accent_hex = accent.primary_hex();
 
+            render_confirm_shell(
+                "Switch to Administrator Mode",
+                Some((LucideIcon::ShieldCheck, accent_hex)),
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(solid(TEXT_PRIMARY))
+                            .child("TexTree will relaunch with Administrator privileges to unlock:"),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_1p5()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(solid(BG_BASE))
+                            .border_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .child(admin_benefit_row(
+                                accent_hex,
+                                "Instant direct NTFS Master File Table (MFT) scanning",
+                            ))
+                            .child(admin_benefit_row(
+                                accent_hex,
+                                "Full access to protected system folders (Access Denied)",
+                            ))
+                            .child(admin_benefit_row(
+                                accent_hex,
+                                "Elevated and system process file-lock inspection",
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_1()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(soft_tint(accent_hex, 0.08))
+                            .border_1()
+                            .border_color(soft_tint(accent_hex, 0.28))
+                            .child(
+                                Checkbox::new("confirm-admin-persist")
+                                    .checked(persist)
+                                    .label("Always start TexTree in Administrator Mode")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_admin_prompt_persist(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(solid(TEXT_MUTED))
+                                    .child(
+                                        "This prompt is only shown once. You can change this later in Settings → Scanning & Safety.",
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .pt_1()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("confirm-admin-cancel")
+                                    .with_size(Size::Small)
+                                    .secondary()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_confirm(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-admin-accept")
+                                    .with_size(Size::Small)
+                                    .primary()
+                                    .icon(LucideIcon::ShieldCheck)
+                                    .label("Continue as Admin")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.accept_confirm(cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+                cx,
+            )
+        }
+    }
+}
+
+fn admin_benefit_row(accent_hex: u32, text: &'static str) -> impl IntoElement {
+    h_flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(5.))
+                .h(px(5.))
+                .flex_shrink_0()
+                .rounded(px(999.))
+                .bg(solid(accent_hex)),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(solid(TEXT_SECONDARY))
+                .child(text),
+        )
+}
+
+fn render_confirm_shell(
+    title: &'static str,
+    header_icon: Option<(LucideIcon, u32)>,
+    body: gpui_kit::AnyElement,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     div()
         .id("confirm-dialog-root")
         .absolute()
@@ -131,11 +323,19 @@ pub fn render_confirm_modal(
                         .border_b_1()
                         .border_color(solid(BORDER_SUBTLE))
                         .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(solid(TEXT_PRIMARY))
-                                .child("Move to Recycle Bin"),
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .when_some(header_icon, |row, (icon, color)| {
+                                    row.child(Icon::new(icon).small().text_color(solid(color)))
+                                })
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .text_color(solid(TEXT_PRIMARY))
+                                        .child(title),
+                                ),
                         )
                         .child(
                             Button::new("confirm-dialog-close")
@@ -147,62 +347,7 @@ pub fn render_confirm_modal(
                                 })),
                         ),
                 )
-                .child(
-                    v_flex()
-                        .p_4()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_medium()
-                                .text_color(solid(TEXT_PRIMARY))
-                                .child(SharedString::from(summary)),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .p_2()
-                                .rounded(px(RADIUS_CONTROL))
-                                .bg(solid(BG_BASE))
-                                .border_1()
-                                .border_color(solid(BORDER_SUBTLE))
-                                .text_xs()
-                                .text_color(solid(TEXT_SECONDARY))
-                                .child(SharedString::from(path.to_string_lossy().into_owned())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(solid(TEXT_MUTED))
-                                .child("Items moved to the Recycle Bin can be restored from your operating system."),
-                        )
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .pt_1()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    Button::new("confirm-dialog-cancel")
-                                        .with_size(Size::Small)
-                                        .secondary()
-                                        .label("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.dismiss_confirm(cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("confirm-dialog-accept")
-                                        .with_size(Size::Small)
-                                        .danger()
-                                        .icon(IconName::Delete)
-                                        .label("Move to Trash")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.accept_confirm(cx);
-                                        })),
-                                ),
-                        ),
-                ),
+                .child(body),
         )
 }
 
