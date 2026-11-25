@@ -202,7 +202,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                             .danger()
                                             .icon(IconName::Delete)
                                             .label("Trash")
-                                            .tooltip("Move to Recycle Bin (Delete)")
+                                            .tooltip("Move to Recycle Bin (Shift+Del)")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.request_trash_selected(cx);
                                             })),

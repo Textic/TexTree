@@ -1612,9 +1612,9 @@ impl Workspace {
             }
             (_, "delete") => {
                 if event.keystroke.modifiers.shift {
-                    self.request_permanent_delete_selected(cx);
-                } else {
                     self.request_trash_selected(cx);
+                } else {
+                    self.request_permanent_delete_selected(cx);
                 }
             }
             (_, "backspace") => {

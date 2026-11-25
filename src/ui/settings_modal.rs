@@ -1188,7 +1188,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .child(
                     Checkbox::new("set-confirm-trash")
                         .checked(confirm_trash)
-                        .label("Ask for confirmation before moving items to the Recycle Bin")
+                        .label("Ask for confirmation before moving items to the Recycle Bin (Shift+Del)")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_confirm_before_trash(cx);
                         })),
@@ -1196,7 +1196,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .child(
                     Checkbox::new("set-confirm-perm-del")
                         .checked(confirm_perm_del)
-                        .label("Ask for confirmation before permanently deleting items (Shift+Del)")
+                        .label("Ask for confirmation before permanently deleting items (Del)")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_confirm_before_permanent_delete(cx);
                         })),

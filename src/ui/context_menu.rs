@@ -381,20 +381,20 @@ fn build_menu_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     rows.push(MenuRow::Separator);
                 }
                 rows.push(MenuRow::Item {
-                    id: "ctx-trash",
-                    label: "Move to Recycle Bin".into(),
-                    shortcut: Some("Del"),
-                    icon: MenuIcon::Kit(IconName::Delete),
-                    danger: true,
-                    action: MenuAction::TrashNode(*node_id),
-                });
-                rows.push(MenuRow::Item {
                     id: "ctx-perm-delete",
                     label: "Delete Permanently".into(),
-                    shortcut: Some("Shift+Del"),
+                    shortcut: Some("Del"),
                     icon: MenuIcon::Lucide(LucideIcon::ShieldAlert),
                     danger: true,
                     action: MenuAction::PermanentDeleteNode(*node_id),
+                });
+                rows.push(MenuRow::Item {
+                    id: "ctx-trash",
+                    label: "Move to Recycle Bin".into(),
+                    shortcut: Some("Shift+Del"),
+                    icon: MenuIcon::Kit(IconName::Delete),
+                    danger: true,
+                    action: MenuAction::TrashNode(*node_id),
                 });
             }
         }
