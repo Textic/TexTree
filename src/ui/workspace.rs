@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_channel::mpsc::unbounded;
 use futures_util::StreamExt as _;
@@ -29,7 +29,7 @@ use crate::models::{
     AccentPreset, AppSettings, DiskTree, ExtensionStat, NodeId, ScanMode, SizeUnit, SortColumn,
     SortSpec, VisibleRow, VolumeInfo,
 };
-use crate::platform::{self, FileLockStatus, ServiceStatus};
+use crate::platform::{self, DeleteOutcome, DeleteProgress, FileLockStatus, ServiceStatus};
 use crate::scanner::{self, ScanEvent, ScanProgress, ScanTarget};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
@@ -103,6 +103,18 @@ impl ScanCacheKey {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ActiveDeleteState {
+    pub name: String,
+    pub permanent: bool,
+    pub total_items: u64,
+    pub total_bytes: u64,
+    pub deleted_items: u64,
+    pub deleted_bytes: u64,
+    pub current_path: String,
+    pub elapsed_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct CachedScan {
     pub tree: Arc<DiskTree>,
@@ -154,6 +166,8 @@ pub struct Workspace {
     pub settings_category: SettingsCategory,
     pub pending_confirm: Option<PendingConfirm>,
     pub context_menu: Option<ContextMenuState>,
+    pub active_delete: Option<ActiveDeleteState>,
+    delete_cancel: Option<Arc<AtomicBool>>,
     pub toast_message: Option<(String, bool)>,
     pub dismissed_admin_banner: bool,
     pub update_state: UpdateState,
@@ -224,6 +238,8 @@ impl Workspace {
             settings_category: SettingsCategory::Appearance,
             pending_confirm: None,
             context_menu: None,
+            active_delete: None,
+            delete_cancel: None,
             toast_message: None,
             dismissed_admin_banner: false,
             update_state: UpdateState::Idle,
@@ -845,6 +861,11 @@ impl Workspace {
     }
 
     pub fn request_trash_selected(&mut self, cx: &mut Context<Self>) {
+        if self.active_delete.is_some() {
+            self.toast_message = Some(("Wait for the current deletion to finish.".to_string(), false));
+            cx.notify();
+            return;
+        }
         let Some((node_id, name, path, size, is_dir, item_count)) =
             self.selected_deletable_target()
         else {
@@ -870,6 +891,11 @@ impl Workspace {
     }
 
     pub fn request_permanent_delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.active_delete.is_some() {
+            self.toast_message = Some(("Wait for the current deletion to finish.".to_string(), false));
+            cx.notify();
+            return;
+        }
         let Some((node_id, name, path, size, is_dir, item_count)) =
             self.selected_deletable_target()
         else {
@@ -968,14 +994,18 @@ impl Workspace {
                 node_id,
                 name,
                 path,
+                size,
+                item_count,
                 ..
             } => {
-                self.spawn_remove_item(node_id, name, path, false, cx);
+                self.spawn_remove_item(node_id, name, path, size, item_count.max(1), false, cx);
             }
             PendingConfirm::PermanentDelete {
                 node_id,
                 name,
                 path,
+                size,
+                item_count,
                 dont_ask_again,
                 ..
             } => {
@@ -983,81 +1013,175 @@ impl Workspace {
                     self.settings.confirm_before_permanent_delete = false;
                     self.settings.save();
                 }
-                self.spawn_remove_item(node_id, name, path, true, cx);
+                self.spawn_remove_item(node_id, name, path, size, item_count.max(1), true, cx);
             }
         }
     }
 
+    pub fn cancel_active_delete(&mut self, cx: &mut Context<Self>) {
+        if let Some(flag) = &self.delete_cancel {
+            flag.store(true, Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn spawn_remove_item(
         &mut self,
         node_id: NodeId,
         name: String,
         path: PathBuf,
+        total_bytes: u64,
+        total_items: u64,
         permanent: bool,
         cx: &mut Context<Self>,
     ) {
+        enum DeleteMsg {
+            Progress(DeleteProgress),
+            TickElapsed(u64),
+            Finished(Result<DeleteOutcome, String>),
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.delete_cancel = Some(cancel.clone());
+        self.toast_message = None;
+        self.active_delete = Some(ActiveDeleteState {
+            name: name.clone(),
+            permanent,
+            total_items,
+            total_bytes,
+            deleted_items: 0,
+            deleted_bytes: 0,
+            current_path: path.to_string_lossy().into_owned(),
+            elapsed_ms: 0,
+        });
+        cx.notify();
+
         let removed_path = path.clone();
-        let (tx, mut rx) = unbounded::<Result<(), String>>();
+        let (tx, mut rx) = unbounded::<DeleteMsg>();
         std::thread::spawn(move || {
-            let res = if permanent {
-                platform::delete_permanently(&path)
+            if permanent {
+                let tx_prog = tx.clone();
+                let res = platform::delete_permanently_with_progress(&path, &cancel, |p| {
+                    let _ = tx_prog.unbounded_send(DeleteMsg::Progress(p));
+                });
+                let _ = tx.unbounded_send(DeleteMsg::Finished(res));
             } else {
-                platform::move_to_trash(&path)
-            };
-            let _ = tx.unbounded_send(res);
+                let done = Arc::new(AtomicBool::new(false));
+                let done_tick = done.clone();
+                let tx_tick = tx.clone();
+                let started = Instant::now();
+                let ticker = std::thread::spawn(move || {
+                    while !done_tick.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(120));
+                        if done_tick.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = tx_tick.unbounded_send(DeleteMsg::TickElapsed(
+                            started.elapsed().as_millis() as u64,
+                        ));
+                    }
+                });
+                let res = platform::move_to_trash(&path).map(|()| DeleteOutcome::Completed);
+                done.store(true, Ordering::Relaxed);
+                let _ = ticker.join();
+                let _ = tx.unbounded_send(DeleteMsg::Finished(res));
+            }
         });
 
         cx.spawn(async move |this, cx| {
-            if let Some(res) = rx.next().await {
-                let _ = this.update(cx, |this, cx| match res {
-                    Ok(()) => {
-                        let parent_id = this
-                            .tree
-                            .as_ref()
-                            .and_then(|t| t.get(node_id))
-                            .and_then(|n| n.parent);
-                        if let Some(tree) = &mut this.tree {
-                            Arc::make_mut(tree).remove_subtree_soft(node_id);
-                            this.tree_version = this.tree_version.wrapping_add(1);
-                        }
-                        let current_key = ScanCacheKey::from_target(&this.selected_target);
-                        if let Some(tree) = this.tree.clone()
-                            && let Some(entry) = this.scan_cache.get_mut(&current_key)
-                        {
-                            entry.tree = tree;
-                        }
-                        for (k, entry) in this.scan_cache.iter_mut() {
-                            if *k == current_key {
-                                continue;
+            while let Some(msg) = rx.next().await {
+                match msg {
+                    DeleteMsg::Progress(p) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(st) = &mut this.active_delete {
+                                st.deleted_items = p.deleted_items;
+                                st.deleted_bytes = p.deleted_bytes;
+                                st.current_path = p.current_path;
+                                st.elapsed_ms = p.elapsed_ms;
+                                cx.notify();
                             }
-                            if let Some(other_id) = entry.tree.find_node_by_path(&removed_path) {
-                                Arc::make_mut(&mut entry.tree).remove_subtree_soft(other_id);
+                        });
+                    }
+                    DeleteMsg::TickElapsed(ms) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(st) = &mut this.active_delete {
+                                st.elapsed_ms = ms;
+                                cx.notify();
                             }
-                        }
-                        this.selected_node = parent_id;
-                        this.treemap_hovered = None;
-                        this.list_hovered = None;
-                        this.lock_status = FileLockStatus::NotApplicable;
-                        this.refresh_selection_cache();
-                        this.rebuild_cached_views();
-                        this.volumes = platform::list_volumes();
-                        let msg = if permanent {
-                            format!("Permanently deleted \"{name}\".")
-                        } else {
-                            format!("Moved \"{name}\" to Recycle Bin.")
-                        };
-                        this.toast_message = Some((msg, false));
-                        cx.notify();
+                        });
                     }
-                    Err(err) => {
-                        this.toast_message = Some((err, true));
-                        cx.notify();
+                    DeleteMsg::Finished(res) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.active_delete = None;
+                            this.delete_cancel = None;
+                            match res {
+                                Ok(DeleteOutcome::Completed) => {
+                                    let parent_id = this
+                                        .tree
+                                        .as_ref()
+                                        .and_then(|t| t.get(node_id))
+                                        .and_then(|n| n.parent);
+                                    if let Some(tree) = &mut this.tree {
+                                        Arc::make_mut(tree).remove_subtree_soft(node_id);
+                                        this.tree_version = this.tree_version.wrapping_add(1);
+                                    }
+                                    let current_key =
+                                        ScanCacheKey::from_target(&this.selected_target);
+                                    if let Some(tree) = this.tree.clone()
+                                        && let Some(entry) = this.scan_cache.get_mut(&current_key)
+                                    {
+                                        entry.tree = tree;
+                                    }
+                                    for (k, entry) in this.scan_cache.iter_mut() {
+                                        if *k == current_key {
+                                            continue;
+                                        }
+                                        if let Some(other_id) =
+                                            entry.tree.find_node_by_path(&removed_path)
+                                        {
+                                            Arc::make_mut(&mut entry.tree)
+                                                .remove_subtree_soft(other_id);
+                                        }
+                                    }
+                                    this.selected_node = parent_id;
+                                    this.treemap_hovered = None;
+                                    this.list_hovered = None;
+                                    this.lock_status = FileLockStatus::NotApplicable;
+                                    this.refresh_selection_cache();
+                                    this.rebuild_cached_views();
+                                    this.volumes = platform::list_volumes();
+                                    let msg = if permanent {
+                                        format!("Permanently deleted \"{name}\".")
+                                    } else {
+                                        format!("Moved \"{name}\" to Recycle Bin.")
+                                    };
+                                    this.toast_message = Some((msg, false));
+                                    cx.notify();
+                                }
+                                Ok(DeleteOutcome::Cancelled { deleted_items }) => {
+                                    this.volumes = platform::list_volumes();
+                                    this.toast_message = Some((
+                                        format!(
+                                            "Stopped deleting \"{name}\" after {} item(s). Press F5 to refresh.",
+                                            format_count(deleted_items)
+                                        ),
+                                        false,
+                                    ));
+                                    cx.notify();
+                                }
+                                Err(err) => {
+                                    this.toast_message = Some((err, true));
+                                    cx.notify();
+                                }
+                            }
+                        });
+                        break;
                     }
-                });
+                }
             }
         })
         .detach();
-        cx.notify();
     }
 
     // --- Settings mutators ---
@@ -1778,6 +1902,42 @@ impl Workspace {
                     .gap_1p5()
                     .pr_1p5()
                     .flex_shrink_0()
+                    .when_some(self.active_delete.as_ref(), |row, del| {
+                        let label = if del.permanent && del.total_items > 1 {
+                            let pct = ((del.deleted_items as f64 / del.total_items.max(1) as f64)
+                                * 100.0)
+                                .clamp(0.0, 99.0) as u64;
+                            format!("Deleting \"{}\"… {pct}%", del.name)
+                        } else if del.permanent {
+                            format!("Deleting \"{}\"…", del.name)
+                        } else {
+                            format!("Trashing \"{}\"…", del.name)
+                        };
+                        row.child(
+                            h_flex()
+                                .id("hdr-delete-pill")
+                                .max_w(px(240.))
+                                .px_2()
+                                .py_0p5()
+                                .gap_1()
+                                .items_center()
+                                .rounded(px(RADIUS_CONTROL))
+                                .bg(soft_tint(STATUS_ERROR, 0.14))
+                                .border_1()
+                                .border_color(soft_tint(STATUS_ERROR, 0.35))
+                                .text_xs()
+                                .font_medium()
+                                .text_color(solid(STATUS_ERROR))
+                                .child(Icon::new(IconName::Delete).xsmall())
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .child(SharedString::from(label)),
+                                ),
+                        )
+                    })
                     .when_some(self.toast_message.clone(), |row, (msg, is_err)| {
                         let color = if is_err {
                             STATUS_ERROR
@@ -2065,6 +2225,132 @@ impl Workspace {
                         )
                     }),
             )
+            // Live deletion progress banner (shows current folder/file, counters, progress bar & cancel)
+            .when_some(self.active_delete.clone(), |pane, del| {
+                let frac = if del.permanent && del.total_items > 0 {
+                    (del.deleted_items as f32 / del.total_items.max(1) as f32).clamp(0.02, 1.0)
+                } else {
+                    1.0
+                };
+                let title = if del.permanent {
+                    format!("Deleting \"{}\"…", del.name)
+                } else {
+                    format!("Moving \"{}\" to Recycle Bin…", del.name)
+                };
+                let counter_text = if del.permanent {
+                    format!(
+                        "{} / {} items",
+                        format_count(del.deleted_items),
+                        format_count(del.total_items)
+                    )
+                } else {
+                    format!("{} items", format_count(del.total_items))
+                };
+                let bytes_text = if del.permanent && del.total_bytes > 0 {
+                    format!(
+                        "{} / {}",
+                        format_size(del.deleted_bytes.min(del.total_bytes), unit),
+                        format_size(del.total_bytes, unit)
+                    )
+                } else {
+                    format_size(del.total_bytes, unit)
+                };
+
+                pane.child(
+                    v_flex()
+                        .w_full()
+                        .bg(soft_tint(STATUS_ERROR, 0.10))
+                        .border_b_1()
+                        .border_color(soft_tint(STATUS_ERROR, 0.30))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_h(px(32.))
+                                .px_3()
+                                .py_1()
+                                .gap_3()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(IconName::Delete)
+                                                .xsmall()
+                                                .text_color(solid(STATUS_ERROR)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(solid(STATUS_ERROR))
+                                                .child(SharedString::from(title)),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(solid(TEXT_SECONDARY))
+                                                .child(SharedString::from(del.current_path)),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .gap_3()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .text_color(solid(TEXT_PRIMARY))
+                                                .child(SharedString::from(counter_text)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(solid(TEXT_SECONDARY))
+                                                .child(SharedString::from(bytes_text)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(solid(TEXT_MUTED))
+                                                .child(SharedString::from(format_duration_ms(
+                                                    del.elapsed_ms,
+                                                ))),
+                                        )
+                                        .when(del.permanent, |row| {
+                                            row.child(
+                                                Button::new("banner-cancel-delete")
+                                                    .with_size(Size::XSmall)
+                                                    .secondary()
+                                                    .label("Stop")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.cancel_active_delete(cx);
+                                                    })),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(2.))
+                                .bg(solid(BG_BASE))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui_kit::relative(frac))
+                                        .bg(solid(STATUS_ERROR)),
+                                ),
+                        ),
+                )
+            })
             // Inline live scan banner (only when a tree is already visible)
             .when_some(
                 match &self.scan_state {

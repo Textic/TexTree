@@ -3,8 +3,10 @@ pub mod locks;
 pub mod service_client;
 pub mod volumes;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub use elevation::{is_elevated, relaunch_as_admin};
 pub use locks::{FileLockStatus, inspect_file_lock};
@@ -57,26 +59,140 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
     trash::delete(path).map_err(|e| format!("Failed to move item to Trash: {e}"))
 }
 
+#[derive(Debug, Clone)]
+pub struct DeleteProgress {
+    pub deleted_items: u64,
+    pub deleted_bytes: u64,
+    pub current_path: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Completed,
+    Cancelled { deleted_items: u64 },
+}
+
 /// Permanently deletes a file, symlink, or directory without moving it to the Recycle Bin.
 /// Symlinks and NTFS directory junctions are unlinked directly without deleting their target.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn delete_permanently(path: &Path) -> Result<(), String> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("Failed to inspect item before deletion: {e}"))?;
-    let ft = meta.file_type();
-    if ft.is_symlink() {
-        // On Windows, directory symlinks/junctions require `remove_dir`, while file symlinks use `remove_file`.
-        if std::fs::remove_file(path).is_ok() {
-            return Ok(());
+    let cancel = AtomicBool::new(false);
+    delete_permanently_with_progress(path, &cancel, |_| {}).map(|_| ())
+}
+
+/// Iteratively deletes `path` permanently while streaming live `(deleted_items, deleted_bytes, current_path)`
+/// updates to `on_progress` and honoring `cancel`. Never follows symlinks or NTFS junctions.
+pub fn delete_permanently_with_progress<F>(
+    path: &Path,
+    cancel: &AtomicBool,
+    mut on_progress: F,
+) -> Result<DeleteOutcome, String>
+where
+    F: FnMut(DeleteProgress),
+{
+    let started = Instant::now();
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut deleted_items: u64 = 0;
+    let mut deleted_bytes: u64 = 0;
+
+    let mut stack: Vec<(PathBuf, bool)> = vec![(path.to_path_buf(), false)];
+    let mut emit = |cur: &Path, items: u64, bytes: u64, force: bool| {
+        if force || last_emit.elapsed() >= Duration::from_millis(60) {
+            last_emit = Instant::now();
+            on_progress(DeleteProgress {
+                deleted_items: items,
+                deleted_bytes: bytes,
+                current_path: cur.to_string_lossy().into_owned(),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
         }
-        return std::fs::remove_dir(path)
-            .map_err(|e| format!("Failed to permanently remove symlink: {e}"));
+    };
+
+    while let Some((cur, dir_ready)) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(DeleteOutcome::Cancelled { deleted_items });
+        }
+
+        if dir_ready {
+            remove_dir_handling_readonly(&cur)?;
+            deleted_items = deleted_items.saturating_add(1);
+            emit(&cur, deleted_items, deleted_bytes, false);
+            continue;
+        }
+
+        let meta = std::fs::symlink_metadata(&cur)
+            .map_err(|e| format!("Failed to inspect \"{}\" before deletion: {e}", cur.display()))?;
+        let ft = meta.file_type();
+
+        if ft.is_symlink() {
+            if std::fs::remove_file(&cur).is_err() {
+                remove_dir_handling_readonly(&cur)?;
+            }
+            deleted_items = deleted_items.saturating_add(1);
+            emit(&cur, deleted_items, deleted_bytes, false);
+        } else if ft.is_dir() {
+            emit(&cur, deleted_items, deleted_bytes, false);
+            stack.push((cur.clone(), true));
+            let entries = std::fs::read_dir(&cur)
+                .map_err(|e| format!("Failed to read folder \"{}\": {e}", cur.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    format!("Failed enumerating folder \"{}\": {e}", cur.display())
+                })?;
+                stack.push((entry.path(), false));
+            }
+        } else {
+            let len = meta.len();
+            remove_file_handling_readonly(&cur)?;
+            deleted_items = deleted_items.saturating_add(1);
+            deleted_bytes = deleted_bytes.saturating_add(len);
+            emit(&cur, deleted_items, deleted_bytes, false);
+        }
     }
-    if ft.is_dir() {
-        std::fs::remove_dir_all(path)
-            .map_err(|e| format!("Failed to permanently delete folder: {e}"))
-    } else {
-        std::fs::remove_file(path)
-            .map_err(|e| format!("Failed to permanently delete file: {e}"))
+
+    emit(path, deleted_items, deleted_bytes, true);
+    Ok(DeleteOutcome::Completed)
+}
+
+fn clear_readonly(path: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
+fn remove_file_handling_readonly(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            clear_readonly(path);
+            std::fs::remove_file(path)
+                .map_err(|e| format!("Failed to permanently delete \"{}\": {e}", path.display()))
+        }
+        Err(err) => Err(format!(
+            "Failed to permanently delete \"{}\": {err}",
+            path.display()
+        )),
+    }
+}
+
+fn remove_dir_handling_readonly(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            clear_readonly(path);
+            std::fs::remove_dir(path)
+                .map_err(|e| format!("Failed to permanently delete folder \"{}\": {e}", path.display()))
+        }
+        Err(err) => Err(format!(
+            "Failed to permanently delete folder \"{}\": {err}",
+            path.display()
+        )),
     }
 }
 
@@ -196,7 +312,17 @@ mod tests {
         assert!(!f1.exists());
 
         std::fs::write(sub.join("b.bin"), b"world").unwrap();
-        delete_permanently(&base).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut last_items = 0u64;
+        let mut last_bytes = 0u64;
+        let outcome = delete_permanently_with_progress(&base, &cancel, |p| {
+            last_items = p.deleted_items;
+            last_bytes = p.deleted_bytes;
+        })
+        .unwrap();
+        assert_eq!(outcome, DeleteOutcome::Completed);
+        assert!(last_items >= 3); // b.bin + nested + base
+        assert_eq!(last_bytes, 5);
         assert!(!base.exists());
     }
 }
