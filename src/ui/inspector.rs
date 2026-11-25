@@ -59,17 +59,17 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         .child(match (&ws.tree, ws.selected_node) {
             (Some(tree), Some(node_id)) if tree.get(node_id).is_some() => {
                 let node = tree.get(node_id).unwrap();
-                let full_path = tree.full_path(node_id);
-                let path_display = full_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| node.name.to_string());
+                let has_fs_path = ws.selected_has_fs_path;
+                let path_display = ws
+                    .selected_full_path
+                    .clone()
+                    .unwrap_or_else(|| node.name.clone());
                 let is_container = node.is_container();
                 let is_virtual = node.flags.contains(NodeFlags::IS_VIRTUAL);
                 let is_volume = node.flags.contains(NodeFlags::IS_VOLUME);
                 let is_denied = node.flags.contains(NodeFlags::ACCESS_DENIED);
                 let can_trash = !is_virtual && !is_volume && node_id != tree.root;
-                let can_rescan = !is_virtual && is_container && full_path.is_some();
+                let can_rescan = !is_virtual && is_container && has_fs_path;
 
                 let kind_label = if is_virtual {
                     "Virtual Root"
@@ -86,11 +86,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 let parent_pct = tree.parent_percent(node_id);
                 let root_pct = tree.root_percent(node_id);
                 let ext = tree.extension_of(node_id).to_string();
-                let top_children = if is_container {
-                    tree.largest_children(node_id, 5)
-                } else {
-                    Vec::new()
-                };
+                let top_children = &ws.selected_top_children;
 
                 v_flex()
                     .flex_1()
@@ -115,7 +111,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                             .text_sm()
                                             .font_semibold()
                                             .text_color(solid(TEXT_PRIMARY))
-                                            .child(SharedString::from(node.name.to_string())),
+                                            .child(node.name.clone()),
                                     )
                                     .child(
                                         div()
@@ -140,11 +136,11 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     .border_color(solid(BORDER_SUBTLE))
                                     .text_xs()
                                     .text_color(solid(TEXT_SECONDARY))
-                                    .child(SharedString::from(path_display)),
+                                    .child(path_display),
                             ),
                     )
                     // Action buttons
-                    .when(full_path.is_some(), |col| {
+                    .when(has_fs_path, |col| {
                         col.child(
                             h_flex()
                                 .w_full()
@@ -284,7 +280,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                             .text_color(solid(TEXT_SECONDARY))
                                             .child("LARGEST CHILDREN"),
                                     )
-                                    .children(top_children.into_iter().enumerate().filter_map(
+                                    .children(top_children.iter().copied().enumerate().filter_map(
                                         |(i, cid)| {
                                             let child = tree.get(cid)?;
                                             let c_pct = tree.parent_percent(cid);
@@ -315,13 +311,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                                             .text_color(solid(
                                                                                 TEXT_PRIMARY,
                                                                             ))
-                                                                            .child(
-                                                                                SharedString::from(
-                                                                                    child
-                                                                                        .name
-                                                                                        .to_string(),
-                                                                                ),
-                                                                            ),
+                                                                            .child(child.name.clone()),
                                                                     )
                                                                     .child(
                                                                         div()

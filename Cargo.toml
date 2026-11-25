@@ -42,3 +42,11 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(windows)'.build-dependencies]
 tauri-winres = "0.3"
+
+# Optimize dependencies in dev builds so GPUI layout (taffy) and GPU rendering
+# run at full frame rate even under `cargo run`, while keeping incremental app rebuilds fast.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

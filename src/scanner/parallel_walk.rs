@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_channel::mpsc::UnboundedSender;
+use gpui_kit::SharedString;
 use rayon::prelude::*;
 
 use crate::models::tree::ExtInterner;
@@ -248,7 +249,7 @@ fn build_tree_from_root(
     target_label: String,
 ) -> DiskTree {
     let mut tree = DiskTree::new(
-        root_temp.name,
+        SharedString::from(root_temp.name.into_string()),
         root_temp.flags,
         root_base_path,
         target_label,
@@ -276,7 +277,7 @@ fn append_temp_subtree(
     let my_id = tree.nodes.len() as NodeId;
     let children = temp.children;
     tree.nodes.push(FileNode {
-        name: temp.name,
+        name: SharedString::from(temp.name.into_string()),
         parent: Some(parent_id),
         children: Vec::with_capacity(children.len()),
         logical_size: temp.logical_size,

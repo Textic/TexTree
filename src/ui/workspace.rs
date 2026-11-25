@@ -85,6 +85,9 @@ pub struct Workspace {
     pub sort: SortSpec,
     pub expanded: HashSet<NodeId>,
     pub selected_node: Option<NodeId>,
+    pub selected_top_children: Vec<NodeId>,
+    pub selected_full_path: Option<SharedString>,
+    pub selected_has_fs_path: bool,
     pub visible_rows: Vec<VisibleRow>,
     pub top_file_rows: Vec<NodeId>,
     pub extension_rows: Vec<ExtensionStat>,
@@ -140,6 +143,9 @@ impl Workspace {
             sort: SortSpec::default(),
             expanded: HashSet::new(),
             selected_node: None,
+            selected_top_children: Vec::new(),
+            selected_full_path: None,
+            selected_has_fs_path: false,
             visible_rows: Vec::new(),
             top_file_rows: Vec::new(),
             extension_rows: Vec::new(),
@@ -215,18 +221,13 @@ impl Workspace {
                             let root_id = tree.root;
                             let mut expanded = HashSet::new();
                             expanded.insert(root_id);
-                            // Also expand first-level drives automatically when scanning Entire PC
-                            if tree.root_node().flags.contains(crate::models::NodeFlags::IS_VIRTUAL) {
-                                for &child in &tree.root_node().children {
-                                    expanded.insert(child);
-                                }
-                            }
                             this.tree = Some(tree);
                             this.expanded = expanded;
                             this.selected_node = Some(root_id);
                             this.lock_status = FileLockStatus::NotApplicable;
                             this.ext_filter = None;
                             this.denied_only_filter = false;
+                            this.refresh_selection_cache();
                             this.rebuild_cached_views();
                             this.volumes = platform::list_volumes();
                             cx.notify();
@@ -337,9 +338,32 @@ impl Workspace {
         let changed = self.selected_node != Some(node_id);
         self.selected_node = Some(node_id);
         if changed {
+            self.refresh_selection_cache();
             self.inspect_lock_for_selected(cx);
         }
         cx.notify();
+    }
+
+    fn refresh_selection_cache(&mut self) {
+        self.selected_top_children.clear();
+        self.selected_full_path = None;
+        self.selected_has_fs_path = false;
+
+        let (Some(tree), Some(node_id)) = (&self.tree, self.selected_node) else {
+            return;
+        };
+        let Some(node) = tree.get(node_id) else {
+            return;
+        };
+        if let Some(path) = tree.full_path(node_id) {
+            self.selected_has_fs_path = true;
+            self.selected_full_path = Some(SharedString::from(path.to_string_lossy().into_owned()));
+        } else {
+            self.selected_full_path = Some(node.name.clone());
+        }
+        if node.is_container() {
+            self.selected_top_children = tree.largest_children(node_id, 5);
+        }
     }
 
     pub fn recheck_selected_lock(&mut self, cx: &mut Context<Self>) {
@@ -570,6 +594,7 @@ impl Workspace {
                         }
                         this.selected_node = parent_id;
                         this.lock_status = FileLockStatus::NotApplicable;
+                        this.refresh_selection_cache();
                         this.rebuild_cached_views();
                         this.volumes = platform::list_volumes();
                         this.toast_message =
