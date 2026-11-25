@@ -1244,23 +1244,48 @@ impl Workspace {
                                 .child(label),
                         )
                     })
-                    .when(cfg!(target_os = "windows") && self.is_elevated, |row| {
-                        row.child(
-                            h_flex()
-                                .px_1p5()
-                                .py_0p5()
-                                .gap_1()
-                                .items_center()
-                                .rounded(px(RADIUS_CONTROL))
-                                .bg(soft_tint(STATUS_SUCCESS, 0.14))
-                                .border_1()
-                                .border_color(soft_tint(STATUS_SUCCESS, 0.30))
-                                .text_xs()
-                                .font_medium()
-                                .text_color(solid(STATUS_SUCCESS))
-                                .child(Icon::new(LucideIcon::ShieldCheck).xsmall())
-                                .child("MFT"),
-                        )
+                    .when(cfg!(target_os = "windows"), |row| {
+                        if self.is_elevated {
+                            row.child(
+                                h_flex()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(soft_tint(STATUS_SUCCESS, 0.14))
+                                    .border_1()
+                                    .border_color(soft_tint(STATUS_SUCCESS, 0.30))
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(STATUS_SUCCESS))
+                                    .child(Icon::new(LucideIcon::ShieldCheck).xsmall())
+                                    .child("MFT"),
+                            )
+                        } else {
+                            row.child(
+                                h_flex()
+                                    .id("hdr-relaunch-admin")
+                                    .px_2()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(soft_tint(accent.primary_hex(), 0.12))
+                                    .border_1()
+                                    .border_color(soft_tint(accent.primary_hex(), 0.35))
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(accent.primary_hex()))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(soft_tint(accent.primary_hex(), 0.22)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.relaunch_as_admin(cx);
+                                    }))
+                                    .child(Icon::new(LucideIcon::Zap).xsmall())
+                                    .child("Admin Mode (MFT)"),
+                            )
+                        }
                     })
                     .child(
                         Button::new("hdr-toggle-treemap")

@@ -340,34 +340,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                 )
                                 .child("Scan Custom Folder..."),
                         ),
-                )
-                .when(cfg!(target_os = "windows") && !ws.is_elevated, |col| {
-                    col.child(
-                        div()
-                            .id("sidebar-relaunch-admin")
-                            .w_full()
-                            .h(px(30.))
-                            .px_2p5()
-                            .rounded(px(RADIUS_CONTROL))
-                            .bg(soft_tint(accent.primary_hex(), 0.08))
-                            .border_1()
-                            .border_color(soft_tint(accent.primary_hex(), 0.25))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_1p5()
-                            .cursor_pointer()
-                            .text_xs()
-                            .font_medium()
-                            .text_color(solid(accent.primary_hex()))
-                            .hover(|s| s.bg(soft_tint(accent.primary_hex(), 0.16)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.relaunch_as_admin(cx);
-                            }))
-                            .child(Icon::new(LucideIcon::Zap).xsmall())
-                            .child("Admin Mode (Fast MFT)"),
-                    )
-                }),
+                ),
         )
         // Compact bottom scan summary card when a scan is finished or running
         .when(ws.tree.is_some() || is_scanning, |panel| {
