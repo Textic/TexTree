@@ -169,6 +169,7 @@ pub struct Workspace {
     pub active_delete: Option<ActiveDeleteState>,
     delete_cancel: Option<Arc<AtomicBool>>,
     pub toast_message: Option<(String, bool)>,
+    toast_seq: u64,
     pub dismissed_admin_banner: bool,
     pub update_state: UpdateState,
     pub last_update_info: Option<UpdateInfo>,
@@ -241,6 +242,7 @@ impl Workspace {
             active_delete: None,
             delete_cancel: None,
             toast_message: None,
+            toast_seq: 0,
             dismissed_admin_banner: false,
             update_state: UpdateState::Idle,
             last_update_info: None,
@@ -254,6 +256,35 @@ impl Workspace {
             ws.run_update_check(false, cx);
         }
         ws
+    }
+
+    pub fn show_toast(&mut self, msg: impl Into<String>, is_err: bool, cx: &mut Context<Self>) {
+        self.toast_seq = self.toast_seq.wrapping_add(1);
+        let seq = self.toast_seq;
+        self.toast_message = Some((msg.into(), is_err));
+        let delay = if is_err {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(3)
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.toast_seq == seq {
+                    this.toast_message = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn clear_toast(&mut self, cx: &mut Context<Self>) {
+        self.toast_seq = self.toast_seq.wrapping_add(1);
+        if self.toast_message.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub fn refresh_volumes(&mut self, cx: &mut Context<Self>) {
@@ -439,8 +470,7 @@ impl Workspace {
                             } else {
                                 ScanState::Idle
                             };
-                            this.toast_message = Some(("Scan cancelled.".to_string(), false));
-                            cx.notify();
+                            this.show_toast("Scan cancelled.", false, cx);
                             should_stop = true;
                         }
                         ScanEvent::Error(err) => {
@@ -789,10 +819,9 @@ impl Workspace {
 
     pub fn reveal_path_in_explorer(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         match platform::reveal_in_file_manager(path) {
-            Ok(()) => self.toast_message = None,
-            Err(err) => self.toast_message = Some((err, true)),
+            Ok(()) => self.clear_toast(cx),
+            Err(err) => self.show_toast(err, true, cx),
         }
-        cx.notify();
     }
 
     pub fn reveal_selected_in_explorer(&mut self, cx: &mut Context<Self>) {
@@ -807,10 +836,9 @@ impl Workspace {
 
     pub fn open_terminal_for_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         match platform::open_terminal_here(path) {
-            Ok(()) => self.toast_message = None,
-            Err(err) => self.toast_message = Some((err, true)),
+            Ok(()) => self.clear_toast(cx),
+            Err(err) => self.show_toast(err, true, cx),
         }
-        cx.notify();
     }
 
     pub fn open_terminal_for_selected(&mut self, cx: &mut Context<Self>) {
@@ -825,10 +853,9 @@ impl Workspace {
 
     pub fn show_properties_for_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         match platform::show_properties_dialog(path) {
-            Ok(()) => self.toast_message = None,
-            Err(err) => self.toast_message = Some((err, true)),
+            Ok(()) => self.clear_toast(cx),
+            Err(err) => self.show_toast(err, true, cx),
         }
-        cx.notify();
     }
 
     pub fn show_properties_for_selected(&mut self, cx: &mut Context<Self>) {
@@ -843,8 +870,7 @@ impl Workspace {
 
     pub fn copy_text_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.toast_message = Some(("Copied to clipboard.".to_string(), false));
-        cx.notify();
+        self.show_toast("Copied to clipboard.", false, cx);
     }
 
     pub fn copy_selected_path(&mut self, cx: &mut Context<Self>) {
@@ -856,14 +882,12 @@ impl Workspace {
         };
         let path_str = path.to_string_lossy().into_owned();
         cx.write_to_clipboard(ClipboardItem::new_string(path_str));
-        self.toast_message = Some(("Path copied to clipboard.".to_string(), false));
-        cx.notify();
+        self.show_toast("Path copied to clipboard.", false, cx);
     }
 
     pub fn request_trash_selected(&mut self, cx: &mut Context<Self>) {
         if self.active_delete.is_some() {
-            self.toast_message = Some(("Wait for the current deletion to finish.".to_string(), false));
-            cx.notify();
+            self.show_toast("Wait for the current deletion to finish.", false, cx);
             return;
         }
         let Some((node_id, name, path, size, is_dir, item_count)) =
@@ -872,6 +896,8 @@ impl Workspace {
             return;
         };
 
+        let protected_warning = platform::check_protected_system_path(&path);
+        let must_confirm = protected_warning.is_some() || self.settings.confirm_before_trash;
         let pending = PendingConfirm::TrashItem {
             node_id,
             name,
@@ -879,9 +905,10 @@ impl Workspace {
             size,
             is_dir,
             item_count,
+            protected_warning,
         };
 
-        if self.settings.confirm_before_trash {
+        if must_confirm {
             self.pending_confirm = Some(pending);
             cx.notify();
         } else {
@@ -892,8 +919,7 @@ impl Workspace {
 
     pub fn request_permanent_delete_selected(&mut self, cx: &mut Context<Self>) {
         if self.active_delete.is_some() {
-            self.toast_message = Some(("Wait for the current deletion to finish.".to_string(), false));
-            cx.notify();
+            self.show_toast("Wait for the current deletion to finish.", false, cx);
             return;
         }
         let Some((node_id, name, path, size, is_dir, item_count)) =
@@ -902,6 +928,9 @@ impl Workspace {
             return;
         };
 
+        let protected_warning = platform::check_protected_system_path(&path);
+        let must_confirm =
+            protected_warning.is_some() || self.settings.confirm_before_permanent_delete;
         let pending = PendingConfirm::PermanentDelete {
             node_id,
             name,
@@ -910,9 +939,10 @@ impl Workspace {
             is_dir,
             item_count,
             dont_ask_again: false,
+            protected_warning,
         };
 
-        if self.settings.confirm_before_permanent_delete {
+        if must_confirm {
             self.pending_confirm = Some(pending);
             cx.notify();
         } else {
@@ -995,8 +1025,7 @@ impl Workspace {
                         self.settings.always_run_as_admin = prev_always;
                         self.settings.admin_prompt_shown = prev_shown;
                         self.settings.save();
-                        self.toast_message = Some((err, true));
-                        cx.notify();
+                        self.show_toast(err, true, cx);
                     }
                 }
             }
@@ -1166,19 +1195,18 @@ impl Workspace {
                                     } else {
                                         format!("Moved \"{name}\" to Recycle Bin.")
                                     };
-                                    this.toast_message = Some((msg, false));
-                                    cx.notify();
+                                    this.show_toast(msg, false, cx);
                                 }
                                 Ok(DeleteOutcome::Cancelled { deleted_items }) => {
                                     this.volumes = platform::list_volumes();
-                                    this.toast_message = Some((
+                                    this.show_toast(
                                         format!(
                                             "Stopped deleting \"{name}\" after {} item(s). Press F5 to refresh.",
                                             format_count(deleted_items)
                                         ),
                                         false,
-                                    ));
-                                    cx.notify();
+                                        cx,
+                                    );
                                 }
                                 Err(err) => {
                                     if cfg!(target_os = "windows")
@@ -1192,10 +1220,10 @@ impl Workspace {
                                                 permanent,
                                                 detail: err,
                                             });
+                                        cx.notify();
                                     } else {
-                                        this.toast_message = Some((err, true));
+                                        this.show_toast(err, true, cx);
                                     }
-                                    cx.notify();
                                 }
                             }
                         });
@@ -1281,8 +1309,7 @@ impl Workspace {
         self.settings.save();
         self.scan_cache.clear();
         self.service_status = platform::query_service_status();
-        self.toast_message = Some((format!("Scan mode set to {}.", mode.label()), false));
-        cx.notify();
+        self.show_toast(format!("Scan mode set to {}.", mode.label()), false, cx);
     }
 
     pub fn open_scanning_settings(&mut self, cx: &mut Context<Self>) {
@@ -1340,28 +1367,28 @@ impl Workspace {
                                 this.settings.scan_mode = ScanMode::Service;
                                 this.settings.always_run_as_admin = false;
                                 this.settings.save();
-                                this.toast_message = Some((
-                                    "TexTree MFT Service is active (no UAC needed).".to_string(),
-                                    false,
-                                ));
                                 if this.tree.is_some()
                                     && !matches!(this.scan_state, ScanState::Scanning(_))
                                 {
                                     this.rescan_current(cx);
                                 }
+                                this.show_toast(
+                                    "TexTree MFT Service is active (no UAC needed).",
+                                    false,
+                                    cx,
+                                );
                             }
                             "uninstall" => {
                                 if this.settings.scan_mode == ScanMode::Service {
                                     this.settings.scan_mode = ScanMode::AdminMft;
                                     this.settings.save();
                                 }
-                                this.toast_message =
-                                    Some(("TexTree MFT Service uninstalled.".to_string(), false));
+                                this.show_toast("TexTree MFT Service uninstalled.", false, cx);
                             }
                             _ => {}
                         },
                         Err(err) => {
-                            this.toast_message = Some((err, true));
+                            this.show_toast(err, true, cx);
                         }
                     }
                     cx.notify();
@@ -1388,15 +1415,10 @@ impl Workspace {
                 self.settings.always_run_as_admin = false;
                 self.settings.save();
                 self.scan_cache.clear();
-                self.toast_message = Some((
-                    "Switched to MFT Service (no UAC needed).".to_string(),
-                    false,
-                ));
                 if self.tree.is_some() && !matches!(self.scan_state, ScanState::Scanning(_)) {
                     self.rescan_current(cx);
-                } else {
-                    cx.notify();
                 }
+                self.show_toast("Switched to MFT Service (no UAC needed).", false, cx);
                 return;
             }
             if platform::find_service_exe().is_some() {
@@ -1422,8 +1444,7 @@ impl Workspace {
                 cx.quit();
             }
             Err(err) => {
-                self.toast_message = Some((err, true));
-                cx.notify();
+                self.show_toast(err, true, cx);
             }
         }
     }
@@ -1446,8 +1467,7 @@ impl Workspace {
                 cx.quit();
             }
             Err(err) => {
-                self.toast_message = Some((err, true));
-                cx.notify();
+                self.show_toast(err, true, cx);
             }
         }
     }
@@ -1735,8 +1755,7 @@ impl Workspace {
 
     pub fn open_github_repo(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = updater::open_url_in_browser(REPO_URL) {
-            self.toast_message = Some((err, true));
-            cx.notify();
+            self.show_toast(err, true, cx);
         }
     }
 
@@ -2039,8 +2058,7 @@ impl Workspace {
                                 .truncate()
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toast_message = None;
-                                    cx.notify();
+                                    this.clear_toast(cx);
                                 }))
                                 .child(SharedString::from(msg)),
                         )

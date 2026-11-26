@@ -13,7 +13,7 @@ use gpui_kit::{
 };
 
 use crate::models::{AccentPreset, NodeId, ScanMode, SizeUnit};
-use crate::platform::{self, ServiceStatus};
+use crate::platform::{self, ProtectedPathWarning, ServiceStatus};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
     STATUS_ERROR, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -59,6 +59,7 @@ pub enum PendingConfirm {
         size: u64,
         is_dir: bool,
         item_count: u64,
+        protected_warning: Option<ProtectedPathWarning>,
     },
     PermanentDelete {
         node_id: NodeId,
@@ -68,6 +69,7 @@ pub enum PendingConfirm {
         is_dir: bool,
         item_count: u64,
         dont_ask_again: bool,
+        protected_warning: Option<ProtectedPathWarning>,
     },
     EnableFastMft {
         service_stopped: bool,
@@ -105,8 +107,10 @@ pub fn render_confirm_modal(
             size,
             is_dir,
             item_count,
+            protected_warning,
             ..
         } => {
+            let is_protected = protected_warning.is_some();
             let summary = if *is_dir {
                 format!(
                     "Move folder \"{name}\" ({}, {} items) to the Recycle Bin?",
@@ -121,11 +125,22 @@ pub fn render_confirm_modal(
             };
 
             render_confirm_shell(
-                "Move to Recycle Bin",
-                None,
+                if is_protected {
+                    "Warning: Critical System Path"
+                } else {
+                    "Move to Recycle Bin"
+                },
+                if is_protected {
+                    Some((LucideIcon::ShieldAlert, STATUS_ERROR))
+                } else {
+                    None
+                },
                 v_flex()
                     .p_4()
                     .gap_3()
+                    .when_some(protected_warning.clone(), |col, warn| {
+                        col.child(render_protected_path_callout(&warn))
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -173,7 +188,11 @@ pub fn render_confirm_modal(
                                     .with_size(Size::Small)
                                     .danger()
                                     .icon(IconName::Delete)
-                                    .label("Move to Trash")
+                                    .label(if is_protected {
+                                        "Move to Trash Anyway"
+                                    } else {
+                                        "Move to Trash"
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.accept_confirm(cx);
                                     })),
@@ -190,9 +209,11 @@ pub fn render_confirm_modal(
             is_dir,
             item_count,
             dont_ask_again,
+            protected_warning,
             ..
         } => {
             let dont_ask_again = *dont_ask_again;
+            let is_protected = protected_warning.is_some();
             let summary = if *is_dir {
                 format!(
                     "Permanently delete folder \"{name}\" ({}, {} items)?",
@@ -207,11 +228,18 @@ pub fn render_confirm_modal(
             };
 
             render_confirm_shell(
-                "Delete Permanently",
+                if is_protected {
+                    "Warning: Critical System Path"
+                } else {
+                    "Delete Permanently"
+                },
                 Some((LucideIcon::ShieldAlert, STATUS_ERROR)),
                 v_flex()
                     .p_4()
                     .gap_3()
+                    .when_some(protected_warning.clone(), |col, warn| {
+                        col.child(render_protected_path_callout(&warn))
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -249,14 +277,16 @@ pub fn render_confirm_modal(
                                         "This bypasses the Recycle Bin and cannot be undone.",
                                     ),
                             )
-                            .child(
-                                Checkbox::new("confirm-perm-del-dont-ask")
-                                    .checked(dont_ask_again)
-                                    .label("Don't ask me again for permanent deletion")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_perm_delete_dont_ask(cx);
-                                    })),
-                            ),
+                            .when(!is_protected, |box_el| {
+                                box_el.child(
+                                    Checkbox::new("confirm-perm-del-dont-ask")
+                                        .checked(dont_ask_again)
+                                        .label("Don't ask me again for permanent deletion")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_perm_delete_dont_ask(cx);
+                                        })),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
@@ -278,7 +308,11 @@ pub fn render_confirm_modal(
                                     .with_size(Size::Small)
                                     .danger()
                                     .icon(IconName::Delete)
-                                    .label("Delete Permanently")
+                                    .label(if is_protected {
+                                        "Delete Permanently Anyway"
+                                    } else {
+                                        "Delete Permanently"
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.accept_confirm(cx);
                                     })),
@@ -613,6 +647,48 @@ pub fn render_confirm_modal(
             )
         }
     }
+}
+
+fn render_protected_path_callout(warn: &ProtectedPathWarning) -> impl IntoElement {
+    v_flex()
+        .w_full()
+        .p_2p5()
+        .gap_1()
+        .rounded(px(RADIUS_CONTROL))
+        .bg(soft_tint(STATUS_ERROR, 0.14))
+        .border_1()
+        .border_color(solid(STATUS_ERROR))
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .child(
+                    Icon::new(LucideIcon::ShieldAlert)
+                        .xsmall()
+                        .text_color(solid(STATUS_ERROR)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(solid(STATUS_ERROR))
+                        .child(warn.category),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_xs()
+                .text_color(solid(TEXT_PRIMARY))
+                .child(warn.reason),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_xs()
+                .text_color(solid(TEXT_MUTED))
+                .child("Confirmation is always required for critical Windows paths and cannot be skipped."),
+        )
 }
 
 fn admin_benefit_row(accent_hex: u32, text: &'static str) -> impl IntoElement {

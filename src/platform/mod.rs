@@ -17,6 +17,93 @@ pub use service_client::{
 };
 pub use volumes::{cluster_size_for_path, list_volumes};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedPathWarning {
+    pub category: &'static str,
+    pub reason: &'static str,
+}
+
+/// Checks whether `path` targets or resides inside a critical OS/Windows system directory
+/// (such as `Windows`, `Program Files`, `Program Files (x86)`, `ProgramData`,
+/// `System Volume Information`, `Boot`, `Recovery`, `Users` root, or core boot/swap files).
+///
+/// Used to enforce a mandatory confirmation warning 100% of the time regardless of
+/// "Don't ask again" user preferences.
+pub fn check_protected_system_path(path: &Path) -> Option<ProtectedPathWarning> {
+    let raw = path.to_string_lossy();
+    let normalized = raw.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+
+    // Windows drive-rooted path (`c:/...`)
+    let bytes = lower.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let rest = lower.get(2..).unwrap_or("").trim_start_matches('/');
+        if rest.is_empty() {
+            return Some(ProtectedPathWarning {
+                category: "Drive Root",
+                reason: "Deleting a drive root is protected to prevent catastrophic data loss.",
+            });
+        }
+        let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        let first = *segments.first()?;
+
+        return match first {
+            "windows" => Some(ProtectedPathWarning {
+                category: "Windows System Folder",
+                reason: "Deleting files inside Windows can make your operating system unbootable or unstable.",
+            }),
+            "program files" | "program files (x86)" => Some(ProtectedPathWarning {
+                category: "Installed Applications (Program Files)",
+                reason: "Deleting files inside Program Files can break installed applications. Use Windows Uninstall when possible.",
+            }),
+            "programdata" => Some(ProtectedPathWarning {
+                category: "System Application Data (ProgramData)",
+                reason: "ProgramData stores shared configuration, licenses, and service data for Windows and installed apps.",
+            }),
+            "system volume information" => Some(ProtectedPathWarning {
+                category: "System Restore & Volume Metadata",
+                reason: "System Volume Information stores Windows Restore Points, shadow copies, and NTFS metadata.",
+            }),
+            "boot" | "efi" | "recovery" | "$recycle.bin" => Some(ProtectedPathWarning {
+                category: "Windows Boot & Recovery",
+                reason: "Deleting boot, EFI, or recovery files can prevent Windows from starting.",
+            }),
+            "users" if segments.len() <= 2 => Some(ProtectedPathWarning {
+                category: "Windows User Profile Folder",
+                reason: "Deleting a Windows Users or account profile folder permanently removes Desktop, Documents, AppData, and account settings.",
+            }),
+            "pagefile.sys" | "hiberfil.sys" | "swapfile.sys" | "bootmgr" | "bootnxt" | "ntldr"
+            | "bootsect.bak"
+                if segments.len() == 1 =>
+            {
+                Some(ProtectedPathWarning {
+                    category: "Core Windows System File",
+                    reason: "Core root system files are managed by Windows for booting, hibernation, and virtual memory.",
+                })
+            }
+            _ => None,
+        };
+    }
+
+    // Unix / macOS critical OS paths
+    if lower.starts_with('/') {
+        let segments: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
+        let first = *segments.first()?;
+        return match first {
+            "system" | "bin" | "sbin" | "usr" | "etc" | "boot" | "lib" | "lib64" => {
+                Some(ProtectedPathWarning {
+                    category: "Operating System Folder",
+                    reason: "Deleting core operating system files can prevent your computer from booting.",
+                })
+            }
+            _ => None,
+        };
+    }
+
+    None
+}
+
 /// Opens the OS file manager and highlights `path`.
 pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -343,5 +430,25 @@ mod tests {
         assert!(is_permission_denied_error("Failed to permanently delete \"C:\\Windows\\foo\": Access is denied. (os error 5)"));
         assert!(is_permission_denied_error("Permission denied (0x80070005)"));
         assert!(!is_permission_denied_error("The process cannot access the file because it is being used by another process."));
+    }
+
+    #[test]
+    fn detects_critical_windows_system_paths_without_false_positives() {
+        assert!(check_protected_system_path(Path::new(r"C:\Windows")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\Windows\System32\kernel32.dll")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\Program Files\TexTree")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\Program Files (x86)\Steam\steam.exe")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\ProgramData\Microsoft")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\System Volume Information")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\Boot\BCD")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\Users")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\Users\danie")).is_some());
+        assert!(check_protected_system_path(Path::new(r"C:\pagefile.sys")).is_some());
+
+        // Normal user project/download/game paths must NOT be flagged
+        assert!(check_protected_system_path(Path::new(r"C:\Users\danie\Downloads\archive.zip")).is_none());
+        assert!(check_protected_system_path(Path::new(r"C:\Users\danie\Documents\project\target")).is_none());
+        assert!(check_protected_system_path(Path::new(r"X:\TexTree\target")).is_none());
+        assert!(check_protected_system_path(Path::new(r"D:\Games\OldGame")).is_none());
     }
 }
