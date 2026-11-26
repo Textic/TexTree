@@ -971,6 +971,16 @@ impl Workspace {
             return;
         };
         match action {
+            PendingConfirm::EnableFastMft { service_stopped } => {
+                if service_stopped {
+                    self.start_mft_service(cx);
+                } else {
+                    self.install_mft_service(cx);
+                }
+            }
+            PendingConfirm::DeleteRequiresAdmin { .. } => {
+                self.relaunch_as_admin_once(cx);
+            }
             PendingConfirm::AdminMode { persist } => {
                 let prev_always = self.settings.always_run_as_admin;
                 let prev_shown = self.settings.admin_prompt_shown;
@@ -1171,7 +1181,20 @@ impl Workspace {
                                     cx.notify();
                                 }
                                 Err(err) => {
-                                    this.toast_message = Some((err, true));
+                                    if cfg!(target_os = "windows")
+                                        && !this.is_elevated
+                                        && platform::is_permission_denied_error(&err)
+                                    {
+                                        this.pending_confirm =
+                                            Some(PendingConfirm::DeleteRequiresAdmin {
+                                                name: name.clone(),
+                                                path: removed_path.clone(),
+                                                permanent,
+                                                detail: err,
+                                            });
+                                    } else {
+                                        this.toast_message = Some((err, true));
+                                    }
                                     cx.notify();
                                 }
                             }
@@ -1321,6 +1344,11 @@ impl Workspace {
                                     "TexTree MFT Service is active (no UAC needed).".to_string(),
                                     false,
                                 ));
+                                if this.tree.is_some()
+                                    && !matches!(this.scan_state, ScanState::Scanning(_))
+                                {
+                                    this.rescan_current(cx);
+                                }
                             }
                             "uninstall" => {
                                 if this.settings.scan_mode == ScanMode::Service {
@@ -1348,6 +1376,58 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn request_fast_mft(&mut self, cx: &mut Context<Self>) {
+        if self.has_mft_privileges() {
+            self.open_scanning_settings(cx);
+            return;
+        }
+        if cfg!(target_os = "windows") {
+            self.service_status = platform::query_service_status();
+            if self.service_status == ServiceStatus::Running {
+                self.settings.scan_mode = ScanMode::Service;
+                self.settings.always_run_as_admin = false;
+                self.settings.save();
+                self.scan_cache.clear();
+                self.toast_message = Some((
+                    "Switched to MFT Service (no UAC needed).".to_string(),
+                    false,
+                ));
+                if self.tree.is_some() && !matches!(self.scan_state, ScanState::Scanning(_)) {
+                    self.rescan_current(cx);
+                } else {
+                    cx.notify();
+                }
+                return;
+            }
+            if platform::find_service_exe().is_some() {
+                self.pending_confirm = Some(PendingConfirm::EnableFastMft {
+                    service_stopped: self.service_status == ServiceStatus::Stopped,
+                });
+                cx.notify();
+                return;
+            }
+        }
+        self.relaunch_as_admin(cx);
+    }
+
+    pub fn relaunch_as_admin_once(&mut self, cx: &mut Context<Self>) {
+        self.pending_confirm = None;
+        if self.is_elevated {
+            cx.notify();
+            return;
+        }
+        match platform::relaunch_as_admin() {
+            Ok(()) => {
+                self.settings.save();
+                cx.quit();
+            }
+            Err(err) => {
+                self.toast_message = Some((err, true));
+                cx.notify();
+            }
+        }
+    }
+
     pub fn relaunch_as_admin(&mut self, cx: &mut Context<Self>) {
         if self.is_elevated {
             return;
@@ -1356,7 +1436,7 @@ impl Workspace {
             && !self.settings.admin_prompt_shown
             && !self.settings.always_run_as_admin
         {
-            self.pending_confirm = Some(PendingConfirm::AdminMode { persist: true });
+            self.pending_confirm = Some(PendingConfirm::AdminMode { persist: false });
             cx.notify();
             return;
         }
@@ -2050,6 +2130,12 @@ impl Workspace {
                                     .child("Admin · MFT"),
                             )
                         } else {
+                            let has_svc = platform::find_service_exe().is_some();
+                            let pill_label = if has_svc {
+                                "Enable Fast MFT"
+                            } else {
+                                "Admin Mode (MFT)"
+                            };
                             row.child(
                                 h_flex()
                                     .id("hdr-relaunch-admin")
@@ -2068,15 +2154,15 @@ impl Workspace {
                                     .hover(|s| s.bg(soft_tint(accent.primary_hex(), 0.22)))
                                     .tooltip(|window, cx| {
                                         Tooltip::new(
-                                            "Switch to Administrator Mode for instant NTFS MFT scans, protected system folders, and elevated file-lock detection (or install the zero-UAC MFT Service in Settings).",
+                                            "Enable fast direct NTFS MFT scans, protected system folders, and elevated file-lock inspection (install the read-only MFT Service once for zero UAC prompts).",
                                         )
                                         .build(window, cx)
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.relaunch_as_admin(cx);
+                                        this.request_fast_mft(cx);
                                     }))
                                     .child(Icon::new(LucideIcon::Zap).xsmall())
-                                    .child("Admin Mode (MFT)"),
+                                    .child(pill_label),
                             )
                         }
                     })
@@ -2474,16 +2560,19 @@ impl Workspace {
                     } else {
                         LucideIcon::Zap
                     };
+                    let has_svc = platform::find_service_exe().is_some();
                     let message = if has_denied {
                         format!(
-                            "{} protected path(s) skipped. Admin Mode unlocks fast NTFS MFT, system folders & elevated lock detection.",
+                            "{} protected path(s) skipped. Fast MFT unlocks instant NTFS scans, system folders & elevated lock detection.",
                             format_count(u64::from(denied_count))
                         )
                     } else {
-                        "Admin Mode unlocks fast direct NTFS MFT scans, protected system folders & elevated file-lock detection."
+                        "Fast MFT unlocks instant direct NTFS scans, protected system folders & elevated lock detection (zero UAC with MFT Service)."
                             .to_string()
                     };
-                    let cta = if has_denied {
+                    let cta = if has_svc {
+                        "Enable Fast MFT"
+                    } else if has_denied {
                         "Switch to Admin"
                     } else {
                         "Enable Admin"
@@ -2537,7 +2626,7 @@ impl Workspace {
                                             .icon(LucideIcon::ShieldCheck)
                                             .label(cta)
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.relaunch_as_admin(cx);
+                                                this.request_fast_mft(cx);
                                             })),
                                     )
                                     .child(

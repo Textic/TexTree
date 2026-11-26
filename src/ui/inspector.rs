@@ -306,10 +306,10 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                             .with_size(Size::XSmall)
                                                             .secondary()
                                                             .icon(LucideIcon::ShieldCheck)
-                                                            .label("Relaunch as Admin")
+                                                            .label("Enable Fast MFT")
                                                             .on_click(cx.listener(
                                                                 |this, _, _, cx| {
-                                                                    this.relaunch_as_admin(cx);
+                                                                    this.request_fast_mft(cx);
                                                                 },
                                                             )),
                                                     ),
@@ -714,9 +714,9 @@ fn render_lock_card(
                                 .with_size(Size::XSmall)
                                 .secondary()
                                 .icon(LucideIcon::ShieldCheck)
-                                .label("Relaunch as Admin")
+                                .label("Enable Fast MFT")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.relaunch_as_admin(cx);
+                                    this.request_fast_mft(cx);
                                 })),
                         ),
                     )
@@ -755,9 +755,9 @@ fn render_lock_card(
                                 .with_size(Size::XSmall)
                                 .secondary()
                                 .icon(LucideIcon::ShieldCheck)
-                                .label("Relaunch as Admin")
+                                .label("Enable Fast MFT")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.relaunch_as_admin(cx);
+                                    this.request_fast_mft(cx);
                                 })),
                         ),
                     )

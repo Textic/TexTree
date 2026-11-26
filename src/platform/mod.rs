@@ -54,6 +54,18 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Returns `true` if a delete/trash error string indicates OS permission denial
+/// (e.g. Windows `ERROR_ACCESS_DENIED` / `os error 5`) where elevating the session may help.
+pub fn is_permission_denied_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("access is denied")
+        || lower.contains("permission denied")
+        || lower.contains("os error 5")
+        || lower.contains("0x80070005")
+        || lower.contains("privilege")
+        || lower.contains("requires elevation")
+}
+
 /// Moves a file or directory to the OS Recycle Bin / Trash.
 pub fn move_to_trash(path: &Path) -> Result<(), String> {
     trash::delete(path).map_err(|e| format!("Failed to move item to Trash: {e}"))
@@ -324,5 +336,12 @@ mod tests {
         assert!(last_items >= 3); // b.bin + nested + base
         assert_eq!(last_bytes, 5);
         assert!(!base.exists());
+    }
+
+    #[test]
+    fn detects_permission_denied_delete_errors() {
+        assert!(is_permission_denied_error("Failed to permanently delete \"C:\\Windows\\foo\": Access is denied. (os error 5)"));
+        assert!(is_permission_denied_error("Permission denied (0x80070005)"));
+        assert!(!is_permission_denied_error("The process cannot access the file because it is being used by another process."));
     }
 }

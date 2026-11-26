@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.0"
+  #define MyAppVersion "0.3.1"
 #endif
 #ifndef BinaryPath
   #define BinaryPath "..\..\target\release\textree.exe"
@@ -11,7 +11,7 @@
   #define OutputDir "..\..\dist"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "textree-v0.3.0-windows-x86_64-setup"
+  #define OutputBaseFilename "textree-v0.3.1-windows-x86_64-setup"
 #endif
 
 [Setup]
@@ -25,7 +25,7 @@ AppSupportURL=https://github.com/Textic/TexTree/releases
 DefaultDirName={autopf}\TexTree
 DefaultGroupName=TexTree
 AllowNoIcons=yes
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
