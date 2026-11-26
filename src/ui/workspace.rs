@@ -896,6 +896,8 @@ impl Workspace {
             return;
         };
 
+        let protected_warning = platform::check_protected_system_path(&path);
+        let must_confirm = protected_warning.is_some() || self.settings.confirm_before_trash;
         let pending = PendingConfirm::TrashItem {
             node_id,
             name,
@@ -903,9 +905,10 @@ impl Workspace {
             size,
             is_dir,
             item_count,
+            protected_warning,
         };
 
-        if self.settings.confirm_before_trash {
+        if must_confirm {
             self.pending_confirm = Some(pending);
             cx.notify();
         } else {
@@ -925,6 +928,9 @@ impl Workspace {
             return;
         };
 
+        let protected_warning = platform::check_protected_system_path(&path);
+        let must_confirm =
+            protected_warning.is_some() || self.settings.confirm_before_permanent_delete;
         let pending = PendingConfirm::PermanentDelete {
             node_id,
             name,
@@ -933,9 +939,10 @@ impl Workspace {
             is_dir,
             item_count,
             dont_ask_again: false,
+            protected_warning,
         };
 
-        if self.settings.confirm_before_permanent_delete {
+        if must_confirm {
             self.pending_confirm = Some(pending);
             cx.notify();
         } else {
