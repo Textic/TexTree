@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui_kit::{
-    Context, SharedString,
+    Context, MouseButton, MouseDownEvent, SharedString,
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -223,10 +223,16 @@ fn render_file_rows(
             let is_selected = selected == Some(node_id);
             let is_denied = node.flags.contains(NodeFlags::ACCESS_DENIED);
             let pct = tree.root_percent(node_id);
-            let full_path = tree
-                .full_path(node_id)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| node.name.to_string());
+            let file_name = node.name.clone();
+            let parent_dir: Option<SharedString> = tree.full_path(node_id).and_then(|p| {
+                let parent = p.parent()?;
+                let s = parent.to_string_lossy();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(SharedString::from(s.into_owned()))
+                }
+            });
 
             let row_bg = if is_selected {
                 solid(BG_ELEVATED)
@@ -267,6 +273,13 @@ fn render_file_rows(
                             this.clear_list_hovered(Some(node_id), cx);
                         }
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, evt: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_node_context_menu(node_id, false, evt.position, cx);
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_node(node_id, cx);
                     }))
@@ -293,17 +306,29 @@ fn render_file_rows(
                             )
                             .child(
                                 div()
-                                    .min_w_0()
-                                    .flex_1()
+                                    .flex_shrink_0()
+                                    .max_w(px(320.))
                                     .truncate()
                                     .text_xs()
+                                    .font_medium()
                                     .text_color(if is_denied {
                                         solid(STATUS_ERROR)
                                     } else {
                                         solid(TEXT_PRIMARY)
                                     })
-                                    .child(SharedString::from(full_path)),
-                            ),
+                                    .child(file_name),
+                            )
+                            .when_some(parent_dir, |row, dir| {
+                                row.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(solid(TEXT_MUTED))
+                                        .child(dir),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()

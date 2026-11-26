@@ -1,5 +1,5 @@
 use gpui_kit::{
-    Context, SharedString,
+    Context, MouseButton, MouseDownEvent, SharedString,
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -195,6 +195,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                     let is_cached = ws.has_cached_target(&vol_target);
                     let vol_for_select = vol.clone();
                     let vol_for_rescan = vol.clone();
+                    let vol_for_ctx = vol.clone();
                     let title = if vol.label.is_empty() {
                         vol.kind.label().to_string()
                     } else {
@@ -219,6 +220,13 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                             solid(BORDER_SUBTLE)
                         })
                         .hover(|s| s.bg(solid(BG_ELEVATED)))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, evt: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_volume_context_menu(vol_for_ctx.clone(), evt.position, cx);
+                            }),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.select_or_scan_target(
                                 ScanTarget::Volume(vol_for_select.clone()),

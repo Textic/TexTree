@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_channel::mpsc::unbounded;
 use futures_util::StreamExt as _;
@@ -29,7 +29,7 @@ use crate::models::{
     AccentPreset, AppSettings, DiskTree, ExtensionStat, NodeId, ScanMode, SizeUnit, SortColumn,
     SortSpec, VisibleRow, VolumeInfo,
 };
-use crate::platform::{self, FileLockStatus, ServiceStatus};
+use crate::platform::{self, DeleteOutcome, DeleteProgress, FileLockStatus, ServiceStatus};
 use crate::scanner::{self, ScanEvent, ScanProgress, ScanTarget};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
@@ -37,6 +37,7 @@ use crate::theme::{
     apply_obsidian_theme, crisp_resize_handle_appearance, format_count, format_duration_ms,
     format_size, full_hit_input, render_app_badge, soft_tint, solid,
 };
+use crate::ui::context_menu::{ContextMenuState, ContextMenuTarget, render_context_menu};
 use crate::ui::extensions_view::render_extensions_view;
 use crate::ui::files_view::render_files_view;
 use crate::ui::inspector::render_inspector;
@@ -102,6 +103,18 @@ impl ScanCacheKey {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ActiveDeleteState {
+    pub name: String,
+    pub permanent: bool,
+    pub total_items: u64,
+    pub total_bytes: u64,
+    pub deleted_items: u64,
+    pub deleted_bytes: u64,
+    pub current_path: String,
+    pub elapsed_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct CachedScan {
     pub tree: Arc<DiskTree>,
@@ -152,6 +165,9 @@ pub struct Workspace {
     pub show_settings: bool,
     pub settings_category: SettingsCategory,
     pub pending_confirm: Option<PendingConfirm>,
+    pub context_menu: Option<ContextMenuState>,
+    pub active_delete: Option<ActiveDeleteState>,
+    delete_cancel: Option<Arc<AtomicBool>>,
     pub toast_message: Option<(String, bool)>,
     pub dismissed_admin_banner: bool,
     pub update_state: UpdateState,
@@ -221,6 +237,9 @@ impl Workspace {
             show_settings: false,
             settings_category: SettingsCategory::Appearance,
             pending_confirm: None,
+            context_menu: None,
+            active_delete: None,
+            delete_cancel: None,
             toast_message: None,
             dismissed_admin_banner: false,
             update_state: UpdateState::Idle,
@@ -703,6 +722,79 @@ impl Workspace {
         };
     }
 
+    pub fn open_node_context_menu(
+        &mut self,
+        node_id: NodeId,
+        from_treemap: bool,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_node(node_id, cx);
+        self.context_menu = Some(ContextMenuState {
+            position,
+            target: ContextMenuTarget::Node {
+                node_id,
+                from_treemap,
+            },
+        });
+        cx.notify();
+    }
+
+    pub fn open_volume_context_menu(
+        &mut self,
+        vol: VolumeInfo,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(ContextMenuState {
+            position,
+            target: ContextMenuTarget::Volume(vol),
+        });
+        cx.notify();
+    }
+
+    pub fn open_extension_context_menu(
+        &mut self,
+        ext: String,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(ContextMenuState {
+            position,
+            target: ContextMenuTarget::Extension(ext),
+        });
+        cx.notify();
+    }
+
+    pub fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn handle_treemap_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let hit_id = {
+            let cache = self.treemap_cache.borrow();
+            let lx = f32::from(position.x) - f32::from(cache.origin.x);
+            let ly = f32::from(position.y) - f32::from(cache.origin.y);
+            cache.layout.hit_test(lx, ly).map(|r| r.node_id)
+        }
+        .or(self.treemap_root)
+        .or_else(|| self.tree.as_ref().map(|t| t.root));
+
+        if let Some(node_id) = hit_id {
+            self.open_node_context_menu(node_id, true, position, cx);
+        }
+    }
+
+    pub fn reveal_path_in_explorer(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match platform::reveal_in_file_manager(path) {
+            Ok(()) => self.toast_message = None,
+            Err(err) => self.toast_message = Some((err, true)),
+        }
+        cx.notify();
+    }
+
     pub fn reveal_selected_in_explorer(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self
             .selected_node
@@ -710,10 +802,48 @@ impl Workspace {
         else {
             return;
         };
-        match platform::reveal_in_file_manager(&path) {
+        self.reveal_path_in_explorer(&path, cx);
+    }
+
+    pub fn open_terminal_for_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match platform::open_terminal_here(path) {
             Ok(()) => self.toast_message = None,
             Err(err) => self.toast_message = Some((err, true)),
         }
+        cx.notify();
+    }
+
+    pub fn open_terminal_for_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .selected_node
+            .and_then(|id| self.tree.as_ref()?.full_path(id))
+        else {
+            return;
+        };
+        self.open_terminal_for_path(&path, cx);
+    }
+
+    pub fn show_properties_for_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match platform::show_properties_dialog(path) {
+            Ok(()) => self.toast_message = None,
+            Err(err) => self.toast_message = Some((err, true)),
+        }
+        cx.notify();
+    }
+
+    pub fn show_properties_for_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .selected_node
+            .and_then(|id| self.tree.as_ref()?.full_path(id))
+        else {
+            return;
+        };
+        self.show_properties_for_path(&path, cx);
+    }
+
+    pub fn copy_text_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.toast_message = Some(("Copied to clipboard.".to_string(), false));
         cx.notify();
     }
 
@@ -731,33 +861,24 @@ impl Workspace {
     }
 
     pub fn request_trash_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(node_id) = self.selected_node else {
-            return;
-        };
-        let Some(tree) = &self.tree else {
-            return;
-        };
-        let Some(node) = tree.get(node_id) else {
-            return;
-        };
-        if node_id == tree.root
-            || node
-                .flags
-                .intersects(crate::models::NodeFlags::IS_VOLUME | crate::models::NodeFlags::IS_VIRTUAL)
-        {
+        if self.active_delete.is_some() {
+            self.toast_message = Some(("Wait for the current deletion to finish.".to_string(), false));
+            cx.notify();
             return;
         }
-        let Some(path) = tree.full_path(node_id) else {
+        let Some((node_id, name, path, size, is_dir, item_count)) =
+            self.selected_deletable_target()
+        else {
             return;
         };
 
         let pending = PendingConfirm::TrashItem {
             node_id,
-            name: node.name.to_string(),
+            name,
             path,
-            size: node.logical_size,
-            is_dir: node.is_container(),
-            item_count: node.total_items(),
+            size,
+            is_dir,
+            item_count,
         };
 
         if self.settings.confirm_before_trash {
@@ -767,6 +888,61 @@ impl Workspace {
             self.pending_confirm = Some(pending);
             self.accept_confirm(cx);
         }
+    }
+
+    pub fn request_permanent_delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.active_delete.is_some() {
+            self.toast_message = Some(("Wait for the current deletion to finish.".to_string(), false));
+            cx.notify();
+            return;
+        }
+        let Some((node_id, name, path, size, is_dir, item_count)) =
+            self.selected_deletable_target()
+        else {
+            return;
+        };
+
+        let pending = PendingConfirm::PermanentDelete {
+            node_id,
+            name,
+            path,
+            size,
+            is_dir,
+            item_count,
+            dont_ask_again: false,
+        };
+
+        if self.settings.confirm_before_permanent_delete {
+            self.pending_confirm = Some(pending);
+            cx.notify();
+        } else {
+            self.pending_confirm = Some(pending);
+            self.accept_confirm(cx);
+        }
+    }
+
+    fn selected_deletable_target(
+        &self,
+    ) -> Option<(NodeId, String, PathBuf, u64, bool, u64)> {
+        let node_id = self.selected_node?;
+        let tree = self.tree.as_ref()?;
+        let node = tree.get(node_id)?;
+        if node_id == tree.root
+            || node
+                .flags
+                .intersects(crate::models::NodeFlags::IS_VOLUME | crate::models::NodeFlags::IS_VIRTUAL)
+        {
+            return None;
+        }
+        let path = tree.full_path(node_id)?;
+        Some((
+            node_id,
+            node.name.to_string(),
+            path,
+            node.logical_size,
+            node.is_container(),
+            node.total_items(),
+        ))
     }
 
     pub fn dismiss_confirm(&mut self, cx: &mut Context<Self>) {
@@ -781,11 +957,30 @@ impl Workspace {
         }
     }
 
+    pub fn toggle_perm_delete_dont_ask(&mut self, cx: &mut Context<Self>) {
+        if let Some(PendingConfirm::PermanentDelete { dont_ask_again, .. }) =
+            &mut self.pending_confirm
+        {
+            *dont_ask_again = !*dont_ask_again;
+            cx.notify();
+        }
+    }
+
     pub fn accept_confirm(&mut self, cx: &mut Context<Self>) {
         let Some(action) = self.pending_confirm.take() else {
             return;
         };
         match action {
+            PendingConfirm::EnableFastMft { service_stopped } => {
+                if service_stopped {
+                    self.start_mft_service(cx);
+                } else {
+                    self.install_mft_service(cx);
+                }
+            }
+            PendingConfirm::DeleteRequiresAdmin { .. } => {
+                self.relaunch_as_admin_once(cx);
+            }
             PendingConfirm::AdminMode { persist } => {
                 let prev_always = self.settings.always_run_as_admin;
                 let prev_shown = self.settings.admin_prompt_shown;
@@ -809,67 +1004,207 @@ impl Workspace {
                 node_id,
                 name,
                 path,
+                size,
+                item_count,
                 ..
             } => {
-                let trash_path = path.clone();
-                let (tx, mut rx) = unbounded::<Result<(), String>>();
-                std::thread::spawn(move || {
-                    let res = platform::move_to_trash(&path);
-                    let _ = tx.unbounded_send(res);
-                });
+                self.spawn_remove_item(node_id, name, path, size, item_count.max(1), false, cx);
+            }
+            PendingConfirm::PermanentDelete {
+                node_id,
+                name,
+                path,
+                size,
+                item_count,
+                dont_ask_again,
+                ..
+            } => {
+                if dont_ask_again {
+                    self.settings.confirm_before_permanent_delete = false;
+                    self.settings.save();
+                }
+                self.spawn_remove_item(node_id, name, path, size, item_count.max(1), true, cx);
+            }
+        }
+    }
 
-                cx.spawn(async move |this, cx| {
-                    if let Some(res) = rx.next().await {
-                        let _ = this.update(cx, |this, cx| match res {
-                            Ok(()) => {
-                                let parent_id = this
-                                    .tree
-                                    .as_ref()
-                                    .and_then(|t| t.get(node_id))
-                                    .and_then(|n| n.parent);
-                                if let Some(tree) = &mut this.tree {
-                                    Arc::make_mut(tree).remove_subtree_soft(node_id);
-                                    this.tree_version = this.tree_version.wrapping_add(1);
-                                }
-                                let current_key = ScanCacheKey::from_target(&this.selected_target);
-                                if let Some(tree) = this.tree.clone()
-                                    && let Some(entry) = this.scan_cache.get_mut(&current_key)
-                                {
-                                    entry.tree = tree;
-                                }
-                                for (k, entry) in this.scan_cache.iter_mut() {
-                                    if *k == current_key {
-                                        continue;
-                                    }
-                                    if let Some(other_id) =
-                                        entry.tree.find_node_by_path(&trash_path)
-                                    {
-                                        Arc::make_mut(&mut entry.tree)
-                                            .remove_subtree_soft(other_id);
-                                    }
-                                }
-                                this.selected_node = parent_id;
-                                this.treemap_hovered = None;
-                                this.list_hovered = None;
-                                this.lock_status = FileLockStatus::NotApplicable;
-                                this.refresh_selection_cache();
-                                this.rebuild_cached_views();
-                                this.volumes = platform::list_volumes();
-                                this.toast_message =
-                                    Some((format!("Moved \"{name}\" to Recycle Bin."), false));
-                                cx.notify();
-                            }
-                            Err(err) => {
-                                this.toast_message = Some((err, true));
+    pub fn cancel_active_delete(&mut self, cx: &mut Context<Self>) {
+        if let Some(flag) = &self.delete_cancel {
+            flag.store(true, Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_remove_item(
+        &mut self,
+        node_id: NodeId,
+        name: String,
+        path: PathBuf,
+        total_bytes: u64,
+        total_items: u64,
+        permanent: bool,
+        cx: &mut Context<Self>,
+    ) {
+        enum DeleteMsg {
+            Progress(DeleteProgress),
+            TickElapsed(u64),
+            Finished(Result<DeleteOutcome, String>),
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.delete_cancel = Some(cancel.clone());
+        self.toast_message = None;
+        self.active_delete = Some(ActiveDeleteState {
+            name: name.clone(),
+            permanent,
+            total_items,
+            total_bytes,
+            deleted_items: 0,
+            deleted_bytes: 0,
+            current_path: path.to_string_lossy().into_owned(),
+            elapsed_ms: 0,
+        });
+        cx.notify();
+
+        let removed_path = path.clone();
+        let (tx, mut rx) = unbounded::<DeleteMsg>();
+        std::thread::spawn(move || {
+            if permanent {
+                let tx_prog = tx.clone();
+                let res = platform::delete_permanently_with_progress(&path, &cancel, |p| {
+                    let _ = tx_prog.unbounded_send(DeleteMsg::Progress(p));
+                });
+                let _ = tx.unbounded_send(DeleteMsg::Finished(res));
+            } else {
+                let done = Arc::new(AtomicBool::new(false));
+                let done_tick = done.clone();
+                let tx_tick = tx.clone();
+                let started = Instant::now();
+                let ticker = std::thread::spawn(move || {
+                    while !done_tick.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(120));
+                        if done_tick.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = tx_tick.unbounded_send(DeleteMsg::TickElapsed(
+                            started.elapsed().as_millis() as u64,
+                        ));
+                    }
+                });
+                let res = platform::move_to_trash(&path).map(|()| DeleteOutcome::Completed);
+                done.store(true, Ordering::Relaxed);
+                let _ = ticker.join();
+                let _ = tx.unbounded_send(DeleteMsg::Finished(res));
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            while let Some(msg) = rx.next().await {
+                match msg {
+                    DeleteMsg::Progress(p) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(st) = &mut this.active_delete {
+                                st.deleted_items = p.deleted_items;
+                                st.deleted_bytes = p.deleted_bytes;
+                                st.current_path = p.current_path;
+                                st.elapsed_ms = p.elapsed_ms;
                                 cx.notify();
                             }
                         });
                     }
-                })
-                .detach();
-                cx.notify();
+                    DeleteMsg::TickElapsed(ms) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(st) = &mut this.active_delete {
+                                st.elapsed_ms = ms;
+                                cx.notify();
+                            }
+                        });
+                    }
+                    DeleteMsg::Finished(res) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.active_delete = None;
+                            this.delete_cancel = None;
+                            match res {
+                                Ok(DeleteOutcome::Completed) => {
+                                    let parent_id = this
+                                        .tree
+                                        .as_ref()
+                                        .and_then(|t| t.get(node_id))
+                                        .and_then(|n| n.parent);
+                                    if let Some(tree) = &mut this.tree {
+                                        Arc::make_mut(tree).remove_subtree_soft(node_id);
+                                        this.tree_version = this.tree_version.wrapping_add(1);
+                                    }
+                                    let current_key =
+                                        ScanCacheKey::from_target(&this.selected_target);
+                                    if let Some(tree) = this.tree.clone()
+                                        && let Some(entry) = this.scan_cache.get_mut(&current_key)
+                                    {
+                                        entry.tree = tree;
+                                    }
+                                    for (k, entry) in this.scan_cache.iter_mut() {
+                                        if *k == current_key {
+                                            continue;
+                                        }
+                                        if let Some(other_id) =
+                                            entry.tree.find_node_by_path(&removed_path)
+                                        {
+                                            Arc::make_mut(&mut entry.tree)
+                                                .remove_subtree_soft(other_id);
+                                        }
+                                    }
+                                    this.selected_node = parent_id;
+                                    this.treemap_hovered = None;
+                                    this.list_hovered = None;
+                                    this.lock_status = FileLockStatus::NotApplicable;
+                                    this.refresh_selection_cache();
+                                    this.rebuild_cached_views();
+                                    this.volumes = platform::list_volumes();
+                                    let msg = if permanent {
+                                        format!("Permanently deleted \"{name}\".")
+                                    } else {
+                                        format!("Moved \"{name}\" to Recycle Bin.")
+                                    };
+                                    this.toast_message = Some((msg, false));
+                                    cx.notify();
+                                }
+                                Ok(DeleteOutcome::Cancelled { deleted_items }) => {
+                                    this.volumes = platform::list_volumes();
+                                    this.toast_message = Some((
+                                        format!(
+                                            "Stopped deleting \"{name}\" after {} item(s). Press F5 to refresh.",
+                                            format_count(deleted_items)
+                                        ),
+                                        false,
+                                    ));
+                                    cx.notify();
+                                }
+                                Err(err) => {
+                                    if cfg!(target_os = "windows")
+                                        && !this.is_elevated
+                                        && platform::is_permission_denied_error(&err)
+                                    {
+                                        this.pending_confirm =
+                                            Some(PendingConfirm::DeleteRequiresAdmin {
+                                                name: name.clone(),
+                                                path: removed_path.clone(),
+                                                permanent,
+                                                detail: err,
+                                            });
+                                    } else {
+                                        this.toast_message = Some((err, true));
+                                    }
+                                    cx.notify();
+                                }
+                            }
+                        });
+                        break;
+                    }
+                }
             }
-        }
+        })
+        .detach();
     }
 
     // --- Settings mutators ---
@@ -896,6 +1231,13 @@ impl Workspace {
 
     pub fn toggle_confirm_before_trash(&mut self, cx: &mut Context<Self>) {
         self.settings.confirm_before_trash = !self.settings.confirm_before_trash;
+        self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_confirm_before_permanent_delete(&mut self, cx: &mut Context<Self>) {
+        self.settings.confirm_before_permanent_delete =
+            !self.settings.confirm_before_permanent_delete;
         self.settings.save();
         cx.notify();
     }
@@ -1002,6 +1344,11 @@ impl Workspace {
                                     "TexTree MFT Service is active (no UAC needed).".to_string(),
                                     false,
                                 ));
+                                if this.tree.is_some()
+                                    && !matches!(this.scan_state, ScanState::Scanning(_))
+                                {
+                                    this.rescan_current(cx);
+                                }
                             }
                             "uninstall" => {
                                 if this.settings.scan_mode == ScanMode::Service {
@@ -1029,6 +1376,58 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn request_fast_mft(&mut self, cx: &mut Context<Self>) {
+        if self.has_mft_privileges() {
+            self.open_scanning_settings(cx);
+            return;
+        }
+        if cfg!(target_os = "windows") {
+            self.service_status = platform::query_service_status();
+            if self.service_status == ServiceStatus::Running {
+                self.settings.scan_mode = ScanMode::Service;
+                self.settings.always_run_as_admin = false;
+                self.settings.save();
+                self.scan_cache.clear();
+                self.toast_message = Some((
+                    "Switched to MFT Service (no UAC needed).".to_string(),
+                    false,
+                ));
+                if self.tree.is_some() && !matches!(self.scan_state, ScanState::Scanning(_)) {
+                    self.rescan_current(cx);
+                } else {
+                    cx.notify();
+                }
+                return;
+            }
+            if platform::find_service_exe().is_some() {
+                self.pending_confirm = Some(PendingConfirm::EnableFastMft {
+                    service_stopped: self.service_status == ServiceStatus::Stopped,
+                });
+                cx.notify();
+                return;
+            }
+        }
+        self.relaunch_as_admin(cx);
+    }
+
+    pub fn relaunch_as_admin_once(&mut self, cx: &mut Context<Self>) {
+        self.pending_confirm = None;
+        if self.is_elevated {
+            cx.notify();
+            return;
+        }
+        match platform::relaunch_as_admin() {
+            Ok(()) => {
+                self.settings.save();
+                cx.quit();
+            }
+            Err(err) => {
+                self.toast_message = Some((err, true));
+                cx.notify();
+            }
+        }
+    }
+
     pub fn relaunch_as_admin(&mut self, cx: &mut Context<Self>) {
         if self.is_elevated {
             return;
@@ -1037,7 +1436,7 @@ impl Workspace {
             && !self.settings.admin_prompt_shown
             && !self.settings.always_run_as_admin
         {
-            self.pending_confirm = Some(PendingConfirm::AdminMode { persist: true });
+            self.pending_confirm = Some(PendingConfirm::AdminMode { persist: false });
             cx.notify();
             return;
         }
@@ -1342,7 +1741,7 @@ impl Workspace {
     }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_settings || self.pending_confirm.is_some() {
+        if self.show_settings || self.pending_confirm.is_some() || self.context_menu.is_some() {
             return;
         }
         let key = event.keystroke.key.as_str();
@@ -1416,7 +1815,14 @@ impl Workspace {
                     .scroll_to_item(prev_idx, ScrollStrategy::Nearest);
             }
             (_, "delete") => {
-                self.request_trash_selected(cx);
+                if event.keystroke.modifiers.shift {
+                    self.request_trash_selected(cx);
+                } else {
+                    self.request_permanent_delete_selected(cx);
+                }
+            }
+            (_, "backspace") => {
+                self.treemap_zoom_up(cx);
             }
             _ => {}
         }
@@ -1576,6 +1982,42 @@ impl Workspace {
                     .gap_1p5()
                     .pr_1p5()
                     .flex_shrink_0()
+                    .when_some(self.active_delete.as_ref(), |row, del| {
+                        let label = if del.permanent && del.total_items > 1 {
+                            let pct = ((del.deleted_items as f64 / del.total_items.max(1) as f64)
+                                * 100.0)
+                                .clamp(0.0, 99.0) as u64;
+                            format!("Deleting \"{}\"… {pct}%", del.name)
+                        } else if del.permanent {
+                            format!("Deleting \"{}\"…", del.name)
+                        } else {
+                            format!("Trashing \"{}\"…", del.name)
+                        };
+                        row.child(
+                            h_flex()
+                                .id("hdr-delete-pill")
+                                .max_w(px(240.))
+                                .px_2()
+                                .py_0p5()
+                                .gap_1()
+                                .items_center()
+                                .rounded(px(RADIUS_CONTROL))
+                                .bg(soft_tint(STATUS_ERROR, 0.14))
+                                .border_1()
+                                .border_color(soft_tint(STATUS_ERROR, 0.35))
+                                .text_xs()
+                                .font_medium()
+                                .text_color(solid(STATUS_ERROR))
+                                .child(Icon::new(IconName::Delete).xsmall())
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .child(SharedString::from(label)),
+                                ),
+                        )
+                    })
                     .when_some(self.toast_message.clone(), |row, (msg, is_err)| {
                         let color = if is_err {
                             STATUS_ERROR
@@ -1688,6 +2130,12 @@ impl Workspace {
                                     .child("Admin · MFT"),
                             )
                         } else {
+                            let has_svc = platform::find_service_exe().is_some();
+                            let pill_label = if has_svc {
+                                "Enable Fast MFT"
+                            } else {
+                                "Admin Mode (MFT)"
+                            };
                             row.child(
                                 h_flex()
                                     .id("hdr-relaunch-admin")
@@ -1706,15 +2154,15 @@ impl Workspace {
                                     .hover(|s| s.bg(soft_tint(accent.primary_hex(), 0.22)))
                                     .tooltip(|window, cx| {
                                         Tooltip::new(
-                                            "Switch to Administrator Mode for instant NTFS MFT scans, protected system folders, and elevated file-lock detection (or install the zero-UAC MFT Service in Settings).",
+                                            "Enable fast direct NTFS MFT scans, protected system folders, and elevated file-lock inspection (install the read-only MFT Service once for zero UAC prompts).",
                                         )
                                         .build(window, cx)
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.relaunch_as_admin(cx);
+                                        this.request_fast_mft(cx);
                                     }))
                                     .child(Icon::new(LucideIcon::Zap).xsmall())
-                                    .child("Admin Mode (MFT)"),
+                                    .child(pill_label),
                             )
                         }
                     })
@@ -1863,6 +2311,132 @@ impl Workspace {
                         )
                     }),
             )
+            // Live deletion progress banner (shows current folder/file, counters, progress bar & cancel)
+            .when_some(self.active_delete.clone(), |pane, del| {
+                let frac = if del.permanent && del.total_items > 0 {
+                    (del.deleted_items as f32 / del.total_items.max(1) as f32).clamp(0.02, 1.0)
+                } else {
+                    1.0
+                };
+                let title = if del.permanent {
+                    format!("Deleting \"{}\"…", del.name)
+                } else {
+                    format!("Moving \"{}\" to Recycle Bin…", del.name)
+                };
+                let counter_text = if del.permanent {
+                    format!(
+                        "{} / {} items",
+                        format_count(del.deleted_items),
+                        format_count(del.total_items)
+                    )
+                } else {
+                    format!("{} items", format_count(del.total_items))
+                };
+                let bytes_text = if del.permanent && del.total_bytes > 0 {
+                    format!(
+                        "{} / {}",
+                        format_size(del.deleted_bytes.min(del.total_bytes), unit),
+                        format_size(del.total_bytes, unit)
+                    )
+                } else {
+                    format_size(del.total_bytes, unit)
+                };
+
+                pane.child(
+                    v_flex()
+                        .w_full()
+                        .bg(soft_tint(STATUS_ERROR, 0.10))
+                        .border_b_1()
+                        .border_color(soft_tint(STATUS_ERROR, 0.30))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_h(px(32.))
+                                .px_3()
+                                .py_1()
+                                .gap_3()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Icon::new(IconName::Delete)
+                                                .xsmall()
+                                                .text_color(solid(STATUS_ERROR)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(solid(STATUS_ERROR))
+                                                .child(SharedString::from(title)),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(solid(TEXT_SECONDARY))
+                                                .child(SharedString::from(del.current_path)),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .gap_3()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .text_color(solid(TEXT_PRIMARY))
+                                                .child(SharedString::from(counter_text)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(solid(TEXT_SECONDARY))
+                                                .child(SharedString::from(bytes_text)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(solid(TEXT_MUTED))
+                                                .child(SharedString::from(format_duration_ms(
+                                                    del.elapsed_ms,
+                                                ))),
+                                        )
+                                        .when(del.permanent, |row| {
+                                            row.child(
+                                                Button::new("banner-cancel-delete")
+                                                    .with_size(Size::XSmall)
+                                                    .secondary()
+                                                    .label("Stop")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.cancel_active_delete(cx);
+                                                    })),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(2.))
+                                .bg(solid(BG_BASE))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui_kit::relative(frac))
+                                        .bg(solid(STATUS_ERROR)),
+                                ),
+                        ),
+                )
+            })
             // Inline live scan banner (only when a tree is already visible)
             .when_some(
                 match &self.scan_state {
@@ -1986,16 +2560,19 @@ impl Workspace {
                     } else {
                         LucideIcon::Zap
                     };
+                    let has_svc = platform::find_service_exe().is_some();
                     let message = if has_denied {
                         format!(
-                            "{} protected path(s) skipped. Admin Mode unlocks fast NTFS MFT, system folders & elevated lock detection.",
+                            "{} protected path(s) skipped. Fast MFT unlocks instant NTFS scans, system folders & elevated lock detection.",
                             format_count(u64::from(denied_count))
                         )
                     } else {
-                        "Admin Mode unlocks fast direct NTFS MFT scans, protected system folders & elevated file-lock detection."
+                        "Fast MFT unlocks instant direct NTFS scans, protected system folders & elevated lock detection (zero UAC with MFT Service)."
                             .to_string()
                     };
-                    let cta = if has_denied {
+                    let cta = if has_svc {
+                        "Enable Fast MFT"
+                    } else if has_denied {
                         "Switch to Admin"
                     } else {
                         "Enable Admin"
@@ -2049,7 +2626,7 @@ impl Workspace {
                                             .icon(LucideIcon::ShieldCheck)
                                             .label(cta)
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.relaunch_as_admin(cx);
+                                                this.request_fast_mft(cx);
                                             })),
                                     )
                                     .child(
@@ -2496,7 +3073,9 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &CancelOrDismiss, window, cx| {
-                if this.pending_confirm.is_some() {
+                if this.context_menu.is_some() {
+                    this.dismiss_context_menu(cx);
+                } else if this.pending_confirm.is_some() {
                     this.dismiss_confirm(cx);
                 } else if this.show_settings {
                     this.show_settings = false;
@@ -2527,6 +3106,9 @@ impl Render for Workspace {
             }))
             .child(self.render_header(window, cx))
             .child(div().flex_1().min_h_0().w_full().child(body))
+            .when_some(self.context_menu.as_ref(), |root, menu| {
+                root.child(render_context_menu(self, menu, window, cx))
+            })
             .when(self.show_settings, |root| {
                 root.child(render_settings_modal(self, cx))
             })

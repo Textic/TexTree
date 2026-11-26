@@ -89,27 +89,36 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
         .filter(|&hid| hid != treemap_root);
     let hover_from_list = ws.treemap_hovered.is_none() && active_hover.is_some();
 
-    let hover_info: Option<(SharedString, SharedString)> = active_hover.and_then(|hid| {
-        let node = tree.get(hid)?;
-        let path = tree
-            .full_path(hid)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| node.name.to_string());
-        let root_sz = tree.get(treemap_root).map(|r| r.logical_size).unwrap_or(0);
-        let pct = if root_sz == 0 {
-            0.0
-        } else {
-            (node.logical_size as f64 / root_sz as f64 * 100.0).clamp(0.0, 100.0)
-        };
-        Some((
-            SharedString::from(path),
-            SharedString::from(format!(
-                "{} ({:.1}%)",
-                format_size(node.logical_size, unit),
-                pct
-            )),
-        ))
-    });
+    let hover_info: Option<(Option<SharedString>, SharedString, SharedString)> =
+        active_hover.and_then(|hid| {
+            let node = tree.get(hid)?;
+            let parent_prefix = tree.full_path(hid).and_then(|p| {
+                let parent = p.parent()?;
+                let s = parent.to_string_lossy();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(SharedString::from(format_parent_prefix(&s)))
+                }
+            });
+            let item_name = node.name.clone();
+            let root_sz = tree.get(treemap_root).map(|r| r.logical_size).unwrap_or(0);
+            let pct = if root_sz == 0 {
+                0.0
+            } else {
+                (node.logical_size as f64 / root_sz as f64 * 100.0).clamp(0.0, 100.0)
+            };
+            Some((
+                parent_prefix,
+                item_name,
+                SharedString::from(format!(
+                    "{} ({:.1}%)",
+                    format_size(node.logical_size, unit),
+                    pct
+                )),
+            ))
+        });
+    let has_hover_info = hover_info.is_some();
 
     let cache_for_canvas: Rc<RefCell<TreemapCanvasCache>> = ws.treemap_cache.clone();
     let cache_for_paint = ws.treemap_cache.clone();
@@ -138,7 +147,8 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 .child(
                     h_flex()
                         .min_w_0()
-                        .flex_1()
+                        .when(!has_hover_info, |r| r.flex_1())
+                        .when(has_hover_info, |r| r.flex_shrink_0().max_w(px(260.)))
                         .items_center()
                         .gap_1()
                         .overflow_hidden()
@@ -148,7 +158,7 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                                     .with_size(Size::XSmall)
                                     .ghost()
                                     .icon(IconName::ArrowUp)
-                                    .tooltip("Zoom Out One Level (Right-Click)")
+                                    .tooltip("Zoom Out One Level (Backspace)")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.treemap_zoom_up(cx);
                                     })),
@@ -193,22 +203,45 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 )
                 .child(
                     h_flex()
-                        .flex_shrink_0()
+                        .when(has_hover_info, |r| r.flex_1().min_w_0().justify_end())
+                        .when(!has_hover_info, |r| r.flex_shrink_0())
                         .items_center()
                         .gap_2()
-                        .child(if let Some((path, size_pct)) = hover_info {
+                        .child(if let Some((parent_prefix, item_name, size_pct)) = hover_info {
                             h_flex()
-                                .max_w(px(520.))
+                                .flex_1()
+                                .min_w_0()
+                                .justify_end()
                                 .items_center()
                                 .gap_2()
                                 .child(
-                                    div()
+                                    h_flex()
                                         .min_w_0()
                                         .flex_1()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(solid(TEXT_SECONDARY))
-                                        .child(path),
+                                        .justify_end()
+                                        .items_center()
+                                        .overflow_hidden()
+                                        .when_some(parent_prefix, |row, prefix| {
+                                            row.child(
+                                                div()
+                                                    .min_w_0()
+                                                    .flex_shrink(1.0)
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(solid(TEXT_MUTED))
+                                                    .child(prefix),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .max_w(px(340.))
+                                                .truncate()
+                                                .text_xs()
+                                                .font_medium()
+                                                .text_color(solid(TEXT_PRIMARY))
+                                                .child(item_name),
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -279,8 +312,9 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, _, _, cx| {
-                        this.treemap_zoom_up(cx);
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.handle_treemap_context_menu(event.position, cx);
                     }),
                 )
                 .child(
@@ -552,4 +586,35 @@ pub fn render_treemap_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
                 ),
         )
         .into_any_element()
+}
+
+/// Formats a parent directory prefix with a trailing separator and smart middle elision
+/// when the path is very deep so the drive root, immediate parent folders, and full item name
+/// stay clearly visible without cutting off the filename.
+fn format_parent_prefix(parent: &str) -> String {
+    let sep = if cfg!(target_os = "windows") { '\\' } else { '/' };
+    let trimmed = parent.trim_end_matches(['\\', '/']);
+    let with_sep = if trimmed.is_empty() {
+        sep.to_string()
+    } else {
+        format!("{trimmed}{sep}")
+    };
+
+    if with_sep.chars().count() <= 54 {
+        return with_sep;
+    }
+
+    let parts: Vec<&str> = trimmed.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 4 {
+        return with_sep;
+    }
+
+    let head = if parent.starts_with('/') {
+        format!("/{}/{}/", parts[0], parts[1])
+    } else {
+        format!("{}{sep}{}{sep}", parts[0], parts[1])
+    };
+    let tail_a = parts[parts.len() - 2];
+    let tail_b = parts[parts.len() - 1];
+    format!("{head}…{sep}{tail_a}{sep}{tail_b}{sep}")
 }

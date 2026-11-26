@@ -130,6 +130,8 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub confirm_before_trash: bool,
     #[serde(default = "default_true")]
+    pub confirm_before_permanent_delete: bool,
+    #[serde(default = "default_true")]
     pub auto_scan_on_launch: bool,
     #[serde(default = "default_true")]
     pub prefer_ntfs_mft: bool,
@@ -155,6 +157,7 @@ impl Default for AppSettings {
             scan_mode: ScanMode::AdminMft,
             show_hidden_files: true,
             confirm_before_trash: true,
+            confirm_before_permanent_delete: true,
             auto_scan_on_launch: true,
             prefer_ntfs_mft: true,
             always_run_as_admin: false,
@@ -204,6 +207,7 @@ mod tests {
         assert_eq!(defaults.accent.primary_hex(), 0x34d399);
         assert!(defaults.show_hidden_files);
         assert!(defaults.confirm_before_trash);
+        assert!(defaults.confirm_before_permanent_delete);
         assert!(defaults.auto_scan_on_launch);
         assert!(defaults.prefer_ntfs_mft);
         assert!(!defaults.always_run_as_admin);
@@ -217,6 +221,7 @@ mod tests {
             scan_mode: ScanMode::Service,
             show_hidden_files: false,
             confirm_before_trash: true,
+            confirm_before_permanent_delete: false,
             auto_scan_on_launch: false,
             prefer_ntfs_mft: false,
             always_run_as_admin: true,
@@ -230,6 +235,7 @@ mod tests {
         assert_eq!(parsed.size_unit, SizeUnit::Decimal);
         assert_eq!(parsed.scan_mode, ScanMode::Service);
         assert!(!parsed.show_hidden_files);
+        assert!(!parsed.confirm_before_permanent_delete);
         assert!(!parsed.auto_scan_on_launch);
         assert!(!parsed.prefer_ntfs_mft);
         assert!(parsed.always_run_as_admin);
@@ -237,10 +243,11 @@ mod tests {
         assert!(!parsed.show_treemap);
         assert!(!parsed.auto_check_updates);
 
-        // Legacy settings JSON without newer admin/mode flags must deserialize safely.
+        // Legacy settings JSON without newer admin/mode/delete flags must deserialize safely.
         let legacy: AppSettings = serde_json::from_str(r#"{"accent":"Emerald"}"#).unwrap();
         assert!(!legacy.always_run_as_admin);
         assert!(!legacy.admin_prompt_shown);
+        assert!(legacy.confirm_before_permanent_delete);
         assert_eq!(legacy.scan_mode, ScanMode::AdminMft);
     }
 }

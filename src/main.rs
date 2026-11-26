@@ -44,8 +44,10 @@ icon_assets!(
         Monitor,
         ShieldAlert,
         ShieldCheck,
+        Terminal,
         Zap,
         ZoomIn,
+        ZoomOut,
     ]
 );
 

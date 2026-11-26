@@ -60,6 +60,24 @@ pub enum PendingConfirm {
         is_dir: bool,
         item_count: u64,
     },
+    PermanentDelete {
+        node_id: NodeId,
+        name: String,
+        path: std::path::PathBuf,
+        size: u64,
+        is_dir: bool,
+        item_count: u64,
+        dont_ask_again: bool,
+    },
+    EnableFastMft {
+        service_stopped: bool,
+    },
+    DeleteRequiresAdmin {
+        name: String,
+        path: std::path::PathBuf,
+        permanent: bool,
+        detail: String,
+    },
     AdminMode {
         persist: bool,
     },
@@ -156,6 +174,326 @@ pub fn render_confirm_modal(
                                     .danger()
                                     .icon(IconName::Delete)
                                     .label("Move to Trash")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.accept_confirm(cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+                cx,
+            )
+        }
+        PendingConfirm::PermanentDelete {
+            name,
+            path,
+            size,
+            is_dir,
+            item_count,
+            dont_ask_again,
+            ..
+        } => {
+            let dont_ask_again = *dont_ask_again;
+            let summary = if *is_dir {
+                format!(
+                    "Permanently delete folder \"{name}\" ({}, {} items)?",
+                    format_size(*size, unit),
+                    format_count(*item_count)
+                )
+            } else {
+                format!(
+                    "Permanently delete file \"{name}\" ({})?",
+                    format_size(*size, unit)
+                )
+            };
+
+            render_confirm_shell(
+                "Delete Permanently",
+                Some((LucideIcon::ShieldAlert, STATUS_ERROR)),
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(solid(TEXT_PRIMARY))
+                            .child(SharedString::from(summary)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .p_2()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(solid(BG_BASE))
+                            .border_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .text_xs()
+                            .text_color(solid(TEXT_SECONDARY))
+                            .child(SharedString::from(path.to_string_lossy().into_owned())),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_1p5()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(soft_tint(STATUS_ERROR, 0.08))
+                            .border_1()
+                            .border_color(soft_tint(STATUS_ERROR, 0.28))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(solid(STATUS_ERROR))
+                                    .child(
+                                        "This bypasses the Recycle Bin and cannot be undone.",
+                                    ),
+                            )
+                            .child(
+                                Checkbox::new("confirm-perm-del-dont-ask")
+                                    .checked(dont_ask_again)
+                                    .label("Don't ask me again for permanent deletion")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_perm_delete_dont_ask(cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .pt_1()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("confirm-perm-del-cancel")
+                                    .with_size(Size::Small)
+                                    .secondary()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_confirm(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-perm-del-accept")
+                                    .with_size(Size::Small)
+                                    .danger()
+                                    .icon(IconName::Delete)
+                                    .label("Delete Permanently")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.accept_confirm(cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+                cx,
+            )
+        }
+        PendingConfirm::EnableFastMft { service_stopped } => {
+            let service_stopped = *service_stopped;
+            let accent_hex = accent.primary_hex();
+
+            render_confirm_shell(
+                "Enable Fast MFT Mode (No UAC)",
+                Some((LucideIcon::ShieldCheck, accent_hex)),
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(solid(TEXT_PRIMARY))
+                            .child("Unlock full NTFS speed and protected folder visibility:"),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_1p5()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(solid(BG_BASE))
+                            .border_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .child(admin_benefit_row(
+                                accent_hex,
+                                "Instant direct NTFS Master File Table ($MFT) scanning",
+                            ))
+                            .child(admin_benefit_row(
+                                accent_hex,
+                                "Full access to protected system folders (Access Denied)",
+                            ))
+                            .child(admin_benefit_row(
+                                accent_hex,
+                                "Elevated and system process file-lock inspection",
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_1()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(soft_tint(accent_hex, 0.08))
+                            .border_1()
+                            .border_color(soft_tint(accent_hex, 0.28))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(solid(TEXT_PRIMARY))
+                                    .child(if service_stopped {
+                                        "Start TexTree Read-Only MFT Service (Recommended)"
+                                    } else {
+                                        "Install TexTree Read-Only MFT Service (Recommended)"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(solid(TEXT_SECONDARY))
+                                    .child(
+                                        "Runs on demand (~4 MB idle, 0% CPU) and is strictly read-only. Windows asks for UAC once now — after that, TexTree never prompts UAC on launch or reboot.",
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .pt_1()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                Button::new("confirm-mft-cancel")
+                                    .with_size(Size::Small)
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_confirm(cx);
+                                    })),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("confirm-mft-admin-once")
+                                            .with_size(Size::Small)
+                                            .secondary()
+                                            .icon(LucideIcon::Zap)
+                                            .label("Admin Once")
+                                            .tooltip(
+                                                "Relaunch only this session as Administrator via UAC without installing the service",
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.relaunch_as_admin_once(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("confirm-mft-install-svc")
+                                            .with_size(Size::Small)
+                                            .primary()
+                                            .icon(LucideIcon::ShieldCheck)
+                                            .label(if service_stopped {
+                                                "Start Service (No UAC)"
+                                            } else {
+                                                "Install Service (No UAC)"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.accept_confirm(cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .into_any_element(),
+                cx,
+            )
+        }
+        PendingConfirm::DeleteRequiresAdmin {
+            name,
+            path,
+            permanent,
+            detail,
+        } => {
+            let verb = if *permanent {
+                "permanently deleting"
+            } else {
+                "moving to the Recycle Bin"
+            };
+            let headline = format!(
+                "Windows blocked {verb} \"{name}\" because it is protected by system or folder permissions."
+            );
+
+            render_confirm_shell(
+                "Administrator Permission Required",
+                Some((LucideIcon::ShieldAlert, STATUS_WARNING)),
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(solid(TEXT_PRIMARY))
+                            .child(SharedString::from(headline)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .p_2()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(solid(BG_BASE))
+                            .border_1()
+                            .border_color(solid(BORDER_SUBTLE))
+                            .text_xs()
+                            .text_color(solid(TEXT_SECONDARY))
+                            .child(SharedString::from(path.to_string_lossy().into_owned())),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .p_2p5()
+                            .gap_1()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(soft_tint(STATUS_WARNING, 0.08))
+                            .border_1()
+                            .border_color(soft_tint(STATUS_WARNING, 0.28))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(solid(STATUS_WARNING))
+                                    .child(
+                                        "TexTree's MFT Service is strictly read-only for security. To delete protected system items, relaunch this session as Administrator (one-time UAC prompt).",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(solid(TEXT_MUTED))
+                                    .child(SharedString::from(detail.clone())),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .pt_1()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("confirm-del-admin-cancel")
+                                    .with_size(Size::Small)
+                                    .secondary()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dismiss_confirm(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-del-admin-relaunch")
+                                    .with_size(Size::Small)
+                                    .primary()
+                                    .icon(LucideIcon::ShieldCheck)
+                                    .label("Relaunch as Admin")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.accept_confirm(cx);
                                     })),
@@ -711,6 +1049,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
     let accent = ws.settings.accent;
     let show_hidden = ws.settings.show_hidden_files;
     let confirm_trash = ws.settings.confirm_before_trash;
+    let confirm_perm_del = ws.settings.confirm_before_permanent_delete;
     let auto_scan = ws.settings.auto_scan_on_launch;
     let show_treemap = ws.settings.show_treemap;
     let prefer_mft = ws.settings.prefer_ntfs_mft;
@@ -783,6 +1122,8 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     }))
                                     .child(
                                         v_flex()
+                                            .w_full()
+                                            .min_w_0()
                                             .gap_0p5()
                                             .child(
                                                 h_flex()
@@ -792,6 +1133,9 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     .gap_2()
                                                     .child(
                                                         h_flex()
+                                                            .min_w_0()
+                                                            .flex_1()
+                                                            .flex_wrap()
                                                             .items_center()
                                                             .gap_1p5()
                                                             .child(
@@ -804,6 +1148,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                             .when_some(badge, |r, (lbl, col_hex)| {
                                                                 r.child(
                                                                     div()
+                                                                        .flex_shrink_0()
                                                                         .px_1p5()
                                                                         .py_0p5()
                                                                         .rounded(px(3.))
@@ -818,16 +1163,19 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     )
                                                     .when(is_selected, |r| {
                                                         r.child(
-                                                            Icon::new(IconName::Check)
-                                                                .xsmall()
-                                                                .text_color(solid(
-                                                                    accent.primary_hex(),
-                                                                )),
+                                                            div().flex_shrink_0().child(
+                                                                Icon::new(IconName::Check)
+                                                                    .xsmall()
+                                                                    .text_color(solid(
+                                                                        accent.primary_hex(),
+                                                                    )),
+                                                            ),
                                                         )
                                                     }),
                                             )
                                             .child(
                                                 div()
+                                                    .w_full()
                                                     .text_xs()
                                                     .text_color(solid(TEXT_MUTED))
                                                     .child(mode.description()),
@@ -845,26 +1193,35 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                             .bg(solid(BG_BASE))
                             .border_1()
                             .border_color(solid(BORDER_SUBTLE))
+                            .overflow_hidden()
                             .child(
                                 h_flex()
                                     .w_full()
-                                    .items_center()
+                                    .items_start()
                                     .justify_between()
                                     .gap_2()
                                     .child(
                                         h_flex()
-                                            .items_center()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .items_start()
                                             .gap_2()
                                             .child(
-                                                Icon::new(LucideIcon::ShieldCheck)
-                                                    .small()
-                                                    .text_color(solid(status_color)),
+                                                div().flex_shrink_0().pt_0p5().child(
+                                                    Icon::new(LucideIcon::ShieldCheck)
+                                                        .small()
+                                                        .text_color(solid(status_color)),
+                                                ),
                                             )
                                             .child(
                                                 v_flex()
+                                                    .min_w_0()
+                                                    .flex_1()
                                                     .gap_0p5()
                                                     .child(
                                                         h_flex()
+                                                            .w_full()
+                                                            .flex_wrap()
                                                             .items_center()
                                                             .gap_1p5()
                                                             .child(
@@ -876,6 +1233,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                             )
                                                             .child(
                                                                 div()
+                                                                    .flex_shrink_0()
                                                                     .px_1p5()
                                                                     .py_0p5()
                                                                     .rounded(px(3.))
@@ -889,6 +1247,7 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     )
                                                     .child(
                                                         div()
+                                                            .w_full()
                                                             .text_xs()
                                                             .text_color(solid(TEXT_MUTED))
                                                             .child(if has_service_bin {
@@ -900,14 +1259,16 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                             ),
                                     )
                                     .child(
-                                        Button::new("set-svc-refresh")
-                                            .with_size(Size::XSmall)
-                                            .ghost()
-                                            .icon(IconName::RefreshCw)
-                                            .tooltip("Refresh Service Status")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.refresh_service_status(cx);
-                                            })),
+                                        div().flex_shrink_0().child(
+                                            Button::new("set-svc-refresh")
+                                                .with_size(Size::XSmall)
+                                                .ghost()
+                                                .icon(IconName::RefreshCw)
+                                                .tooltip("Refresh Service Status")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.refresh_service_status(cx);
+                                                })),
+                                        ),
                                     ),
                             )
                             .child(
@@ -986,24 +1347,28 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     .justify_between()
                                     .gap_3()
                                     .child(
-                                        Checkbox::new("set-always-admin")
-                                            .checked(always_admin)
-                                            .label(
-                                                "Always request Administrator Mode on launch (UAC mode only)",
-                                            )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_always_run_as_admin(cx);
-                                            })),
+                                        div().min_w_0().flex_1().child(
+                                            Checkbox::new("set-always-admin")
+                                                .checked(always_admin)
+                                                .label(
+                                                    "Always request Administrator Mode on launch (UAC mode only)",
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_always_run_as_admin(cx);
+                                                })),
+                                        ),
                                     )
                                     .when(!is_elevated, |row| {
                                         row.child(
-                                            Button::new("set-relaunch-admin")
-                                                .with_size(Size::XSmall)
-                                                .secondary()
-                                                .label("Relaunch as Admin")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.relaunch_as_admin(cx);
-                                                })),
+                                            div().flex_shrink_0().child(
+                                                Button::new("set-relaunch-admin")
+                                                    .with_size(Size::XSmall)
+                                                    .secondary()
+                                                    .label("Relaunch as Admin")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.relaunch_as_admin(cx);
+                                                    })),
+                                            ),
                                         )
                                     }),
                             ),
@@ -1047,9 +1412,17 @@ fn render_scanning_pane(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .child(
                     Checkbox::new("set-confirm-trash")
                         .checked(confirm_trash)
-                        .label("Ask for confirmation before moving items to the Recycle Bin")
+                        .label("Ask for confirmation before moving items to the Recycle Bin (Shift+Del)")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_confirm_before_trash(cx);
+                        })),
+                )
+                .child(
+                    Checkbox::new("set-confirm-perm-del")
+                        .checked(confirm_perm_del)
+                        .label("Ask for confirmation before permanently deleting items (Del)")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_confirm_before_permanent_delete(cx);
                         })),
                 )
                 .child(
